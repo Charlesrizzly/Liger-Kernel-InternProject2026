@@ -204,6 +204,24 @@ LIGER_KERNEL_IMPL=cutile python your_script.py
 
 `LIGER_KERNEL_IMPL` selects an opt-in implementation registered with Liger (currently `cutile`). Selecting one on an unsupported device, or without the required dependencies installed, raises an error.
 
+### Compare Triton vs DSL Backends (Benchmark)
+
+From `benchmark/`, you can run side-by-side comparisons where one run uses the
+default Triton implementation and the other uses an opt-in DSL backend.
+
+```bash
+# cuTile compare (supported kernels listed by the script)
+python scripts/run_cutile_compare.py --kernel cross_entropy [benchmark args...]
+
+# CuteDSL compare (currently RMSNorm)
+python scripts/run_cutedsl_compare.py --kernel rms_norm [benchmark args...]
+```
+
+Outputs are written to backend-specific benchmark CSV files:
+
+- `benchmark/data/all_benchmark_data_cutile.csv`
+- `benchmark/data/all_benchmark_data_cutedsl.csv`
+
 
 ## Getting Started
 
