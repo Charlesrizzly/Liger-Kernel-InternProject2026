@@ -24,6 +24,7 @@ CUTILE_ENABLED_KERNELS = [
     "geglu",
     "jsd",
     "layer_norm",
+    "rms_norm",
 ]
 
 

@@ -1,12 +1,13 @@
-"""Run a kernel benchmark twice (Triton + CuteDSL) and merge results into one CSV.
+"""Run a kernel benchmark three times (Triton + CuTile + CuteDSL) into one CSV.
 
 Workflow:
     python scripts/run_cutedsl_compare.py --kernel rms_norm [benchmark args...]
 
-This driver spawns the per-kernel benchmark script in two subprocesses with
-different env vars, so all three series (liger_triton / liger_cutedsl /
-huggingface or torch) land in `benchmark/data/all_benchmark_data_cutedsl.csv`
-under distinct `kernel_provider` values, ready for direct plotting via:
+This driver spawns the per-kernel benchmark script in three subprocesses with
+different env vars, so all four series (liger_triton / liger_cutile /
+liger_cutedsl / huggingface or torch) land in
+`benchmark/data/all_benchmark_data_cutedsl.csv` under distinct
+`kernel_provider` values, ready for direct plotting via:
 
     python ../benchmarks_visualizer.py \
         --kernel-name <name> --metric-name speed \
@@ -25,7 +26,7 @@ CUTEDSL_ENABLED_KERNELS = [
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare Triton vs CuteDSL Liger kernels in one CSV.",
+        description="Compare Triton vs CuTile vs CuteDSL Liger kernels in one CSV.",
         # Unknown args are forwarded to the underlying benchmark script.
     )
     parser.add_argument(
@@ -42,10 +43,11 @@ def main():
         print(f"error: benchmark script not found: {bench_script}", file=sys.stderr)
         sys.exit(1)
 
-    # Both runs target the same _cutedsl.csv; provider_tag disambiguates the
+    # All runs target the same _cutedsl.csv; provider_tag disambiguates the
     # "liger" rows so they don't overwrite each other on the dedup key.
     runs = [
         ("triton baseline", {"LIGER_KERNEL_IMPL": "", "LIGER_BENCH_PROVIDER_TAG": "liger_triton"}),
+        ("cutile", {"LIGER_KERNEL_IMPL": "cutile", "LIGER_BENCH_PROVIDER_TAG": "liger_cutile"}),
         ("cutedsl", {"LIGER_KERNEL_IMPL": "cutedsl", "LIGER_BENCH_PROVIDER_TAG": "liger_cutedsl"}),
     ]
 

@@ -213,7 +213,7 @@ default Triton implementation and the other uses an opt-in DSL backend.
 # cuTile compare (supported kernels listed by the script)
 python scripts/run_cutile_compare.py --kernel cross_entropy [benchmark args...]
 
-# CuteDSL compare (currently RMSNorm)
+# CuteDSL compare (currently RMSNorm; includes Triton + CuTile + CuteDSL)
 python scripts/run_cutedsl_compare.py --kernel rms_norm [benchmark args...]
 ```
 
