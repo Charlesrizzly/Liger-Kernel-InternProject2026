@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 
@@ -333,9 +334,7 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Convert x_value to numeric where possible so matplotlib uses a real
-    # numeric axis (proper proportional spacing).  String x_values (e.g.
-    # model names) stay as-is and will be treated as categorical (evenly spaced).
+    # Convert x_value to numeric where possible.
     x_numeric = pd.to_numeric(df["x_value"], errors="coerce")
     is_numeric_x = x_numeric.notna().all()
     if is_numeric_x:
@@ -354,52 +353,55 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     df["kernel_provider"] = pd.Categorical(df["kernel_provider"], categories=order, ordered=True)
     df = df.sort_values(by="kernel_provider")
 
-    plt.figure(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     sns.set(style="whitegrid")
-    try:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=("ci", None),
+
+    x_values = sorted(df["x_value"].unique()) if is_numeric_x else list(dict.fromkeys(df["x_value"].tolist()))
+    x_indices = np.arange(len(x_values), dtype=float)
+
+    n_providers = max(len(order), 1)
+    group_width = 0.8
+    bar_width = group_width / n_providers
+
+    palette = sns.color_palette("tab10", n_colors=n_providers)
+    y50 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_50")
+    y20 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_20")
+    y80 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_80")
+
+    for i, provider in enumerate(order):
+        if provider not in y50.columns:
+            continue
+
+        centers = x_indices - (group_width / 2) + ((i + 0.5) * bar_width)
+        p50 = y50.reindex(x_values)[provider]
+        p20 = y20.reindex(x_values)[provider]
+        p80 = y80.reindex(x_values)[provider]
+        lower = (p50 - p20).to_numpy(dtype=float)
+        upper = (p80 - p50).to_numpy(dtype=float)
+
+        ax.bar(
+            centers,
+            p50.to_numpy(dtype=float),
+            width=bar_width,
+            label=provider,
+            color=palette[i],
+            edgecolor="none",
         )
-    except Exception:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=None,
+        ax.errorbar(
+            centers,
+            p50.to_numpy(dtype=float),
+            yerr=[lower, upper],
+            fmt="none",
+            ecolor="black",
+            elinewidth=1,
+            capsize=3,
         )
 
-    # For numeric x axes, show tick labels only at actual data points
+    ax.set_xticks(x_indices)
     if is_numeric_x:
-        tick_values = sorted(df["x_value"].unique())
-        ax.set_xticks(tick_values)
-        ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in tick_values])
-
-    # Seaborn can't plot pre-computed error bars, so we need to do it manually
-    lines = ax.get_lines()
-    colors = [line.get_color() for line in lines]
-
-    for (_, group_data), color in zip(df.groupby("kernel_provider"), colors):
-        y_error_lower = group_data["y_value_50"] - group_data["y_value_20"]
-        y_error_upper = group_data["y_value_80"] - group_data["y_value_50"]
-        y_error = [y_error_lower, y_error_upper]
-
-        plt.errorbar(
-            group_data["x_value"],
-            group_data["y_value_50"],
-            yerr=y_error,
-            fmt="o",
-            color=color,
-            capsize=5,
-        )
+        ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in x_values])
+    else:
+        ax.set_xticklabels([str(v) for v in x_values])
     # Title includes kernel name, metric, operation mode, and GPU so the
     # PNG is self-describing without relying on the filename.
     gpu = df["gpu_name"].iloc[0] if "gpu_name" in df.columns and not df["gpu_name"].empty else ""
@@ -410,12 +412,12 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     ]
     if gpu:
         title_parts.append(gpu)
-    plt.title(" — ".join(title_parts))
+    ax.set_title(" — ".join(title_parts))
 
-    plt.legend(title="Kernel Provider")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
+    ax.legend(title="Kernel Provider")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    fig.tight_layout()
 
     sweep_suffix = f"_{config.sweep_mode}" if config.sweep_mode else ""
     source_suffix = build_data_source_suffix(config.data_file)
@@ -430,8 +432,8 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
         out_path
     ):  # Save the plot if it doesn't exist or if we want to overwrite it
         os.makedirs(VISUALIZATIONS_PATH, exist_ok=True)
-        plt.savefig(out_path)
-    plt.close()
+        fig.savefig(out_path)
+    plt.close(fig)
 
 
 def main():
