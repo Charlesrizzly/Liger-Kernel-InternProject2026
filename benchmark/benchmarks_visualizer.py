@@ -20,6 +20,19 @@ def resolve_data_path(data_file: str | None) -> str:
     return path if os.path.isabs(path) else os.path.abspath(os.path.join(DATA_DIR, path))
 
 
+def build_data_source_suffix(data_file: str | None) -> str:
+    """Build a stable filename suffix from --data-file to avoid plot collisions.
+
+    If a non-default benchmark CSV is used (e.g. *_cutile.csv or *_cutedsl.csv),
+    append the file stem to output PNG names so different data sources do not
+    silently overwrite or mask each other.
+    """
+    resolved = resolve_data_path(data_file)
+    stem = os.path.splitext(os.path.basename(resolved))[0]
+    default_stem = os.path.splitext(os.path.basename(DEFAULT_DATA_FILE))[0]
+    return "" if stem == default_stem else f"_{stem}"
+
+
 # Map --sweep-mode values to the x_name used in benchmark CSV data.
 # "model_config" sweeps always write x_name="model_config"; token-length
 # sweeps use kernel-specific names (e.g. "T"), so we match them by exclusion.
@@ -405,9 +418,10 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     plt.tight_layout()
 
     sweep_suffix = f"_{config.sweep_mode}" if config.sweep_mode else ""
+    source_suffix = build_data_source_suffix(config.data_file)
     out_path = os.path.join(
         VISUALIZATIONS_PATH,
-        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}.png",
+        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}{source_suffix}.png",
     )
 
     if config.display:
