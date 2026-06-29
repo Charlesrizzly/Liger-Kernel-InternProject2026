@@ -148,4 +148,10 @@ The benchmarking system is designed to provide a **consistent, low-boilerplate w
 
 4. View results
    - Generated plots will be saved in `benchmark/visualizations/`
-   - Filenames include the sweep mode when specified (e.g. `geglu_speed_full_model_config.png`)
+    - Filenames include the sweep mode when specified (e.g. `geglu_speed_full_model_config.png`)
+    - When `--data-file` points to a non-default CSV (for example `data/all_benchmark_data_cutedsl.csv`),
+      the output filename also includes the CSV stem to prevent collisions with plots generated
+      from other data sources.
+
+    Example:
+    - `rms_norm_speed_full_token_length_all_benchmark_data_cutedsl.png`
