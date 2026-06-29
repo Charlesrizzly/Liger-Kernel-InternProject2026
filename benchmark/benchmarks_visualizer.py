@@ -67,6 +67,7 @@ class VisualizationsConfig:
     extra_config_filter: str | None = None
     gpu_filter: str | None = None
     data_file: str | None = None
+    plot_style: str = "bar"
     display: bool = False
     overwrite: bool = False
 
@@ -124,6 +125,13 @@ def parse_args() -> VisualizationsConfig:
         help="Benchmark CSV to read, relative to benchmark/ or absolute. "
         "Defaults to data/all_benchmark_data.csv. Use "
         "data/all_benchmark_data_cutile.csv for Triton vs CuTile comparisons.",
+    )
+    parser.add_argument(
+        "--plot-style",
+        type=str,
+        choices=["bar", "line"],
+        default="bar",
+        help="Plot style for provider comparison. Use 'bar' to avoid overlap when values are identical.",
     )
     parser.add_argument("--display", action="store_true", help="Display the visualization")
     parser.add_argument(
@@ -356,52 +364,97 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     fig, ax = plt.subplots(figsize=(10, 6))
     sns.set(style="whitegrid")
 
-    x_values = sorted(df["x_value"].unique()) if is_numeric_x else list(dict.fromkeys(df["x_value"].tolist()))
-    x_indices = np.arange(len(x_values), dtype=float)
+    if config.plot_style == "line":
+        try:
+            ax = sns.lineplot(
+                data=df,
+                x="x_value",
+                y="y_value_50",
+                hue="kernel_provider",
+                marker="o",
+                palette="tab10",
+                errorbar=("ci", None),
+                ax=ax,
+            )
+        except Exception:
+            ax = sns.lineplot(
+                data=df,
+                x="x_value",
+                y="y_value_50",
+                hue="kernel_provider",
+                marker="o",
+                palette="tab10",
+                errorbar=None,
+                ax=ax,
+            )
 
-    n_providers = max(len(order), 1)
-    group_width = 0.8
-    bar_width = group_width / n_providers
+        lines = ax.get_lines()
+        colors = [line.get_color() for line in lines]
+        for (_, group_data), color in zip(df.groupby("kernel_provider"), colors):
+            y_error_lower = group_data["y_value_50"] - group_data["y_value_20"]
+            y_error_upper = group_data["y_value_80"] - group_data["y_value_50"]
+            y_error = [y_error_lower, y_error_upper]
 
-    palette = sns.color_palette("tab10", n_colors=n_providers)
-    y50 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_50")
-    y20 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_20")
-    y80 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_80")
+            ax.errorbar(
+                group_data["x_value"],
+                group_data["y_value_50"],
+                yerr=y_error,
+                fmt="o",
+                color=color,
+                capsize=5,
+            )
 
-    for i, provider in enumerate(order):
-        if provider not in y50.columns:
-            continue
-
-        centers = x_indices - (group_width / 2) + ((i + 0.5) * bar_width)
-        p50 = y50.reindex(x_values)[provider]
-        p20 = y20.reindex(x_values)[provider]
-        p80 = y80.reindex(x_values)[provider]
-        lower = (p50 - p20).to_numpy(dtype=float)
-        upper = (p80 - p50).to_numpy(dtype=float)
-
-        ax.bar(
-            centers,
-            p50.to_numpy(dtype=float),
-            width=bar_width,
-            label=provider,
-            color=palette[i],
-            edgecolor="none",
-        )
-        ax.errorbar(
-            centers,
-            p50.to_numpy(dtype=float),
-            yerr=[lower, upper],
-            fmt="none",
-            ecolor="black",
-            elinewidth=1,
-            capsize=3,
-        )
-
-    ax.set_xticks(x_indices)
-    if is_numeric_x:
-        ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in x_values])
+        if is_numeric_x:
+            tick_values = sorted(df["x_value"].unique())
+            ax.set_xticks(tick_values)
+            ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in tick_values])
     else:
-        ax.set_xticklabels([str(v) for v in x_values])
+        x_values = sorted(df["x_value"].unique()) if is_numeric_x else list(dict.fromkeys(df["x_value"].tolist()))
+        x_indices = np.arange(len(x_values), dtype=float)
+
+        n_providers = max(len(order), 1)
+        group_width = 0.8
+        bar_width = group_width / n_providers
+
+        palette = sns.color_palette("tab10", n_colors=n_providers)
+        y50 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_50")
+        y20 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_20")
+        y80 = df.pivot(index="x_value", columns="kernel_provider", values="y_value_80")
+
+        for i, provider in enumerate(order):
+            if provider not in y50.columns:
+                continue
+
+            centers = x_indices - (group_width / 2) + ((i + 0.5) * bar_width)
+            p50 = y50.reindex(x_values)[provider]
+            p20 = y20.reindex(x_values)[provider]
+            p80 = y80.reindex(x_values)[provider]
+            lower = (p50 - p20).to_numpy(dtype=float)
+            upper = (p80 - p50).to_numpy(dtype=float)
+
+            ax.bar(
+                centers,
+                p50.to_numpy(dtype=float),
+                width=bar_width,
+                label=provider,
+                color=palette[i],
+                edgecolor="none",
+            )
+            ax.errorbar(
+                centers,
+                p50.to_numpy(dtype=float),
+                yerr=[lower, upper],
+                fmt="none",
+                ecolor="black",
+                elinewidth=1,
+                capsize=3,
+            )
+
+        ax.set_xticks(x_indices)
+        if is_numeric_x:
+            ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in x_values])
+        else:
+            ax.set_xticklabels([str(v) for v in x_values])
     # Title includes kernel name, metric, operation mode, and GPU so the
     # PNG is self-describing without relying on the filename.
     gpu = df["gpu_name"].iloc[0] if "gpu_name" in df.columns and not df["gpu_name"].empty else ""
@@ -461,6 +514,7 @@ def main():
             extra_config_filter=args.extra_config_filter,
             gpu_filter=args.gpu_filter,
             data_file=args.data_file,
+            plot_style=args.plot_style,
             display=args.display,
             overwrite=args.overwrite,
         )
