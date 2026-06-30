@@ -18,10 +18,22 @@ TRANSFORMER_MODULES = {
     "LigerRMSNormFunction": "liger_kernel.transformers.rms_norm",
 }
 
+
+def _has_cuda_tile_runtime() -> bool:
+    try:
+        import cuda.tile  # noqa: F401
+    except Exception:
+        return False
+    return True
+
 pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available(),
         reason="cuTile backend requires CUDA",
+    ),
+    pytest.mark.skipif(
+        not _has_cuda_tile_runtime(),
+        reason="cuTile backend requires cuda-tile runtime",
     ),
     pytest.mark.skipif(
         os.environ.get("LIGER_KERNEL_IMPL", "").strip().lower() != "cutile",
