@@ -20,6 +20,16 @@ def resolve_data_path(data_file: str | None) -> str:
     return path if os.path.isabs(path) else os.path.abspath(os.path.join(DATA_DIR, path))
 
 
+def read_benchmark_data(data_file: str | None) -> pd.DataFrame:
+    """Read benchmark data and normalize an omitted optional config to an empty object."""
+    df = pd.read_csv(resolve_data_path(data_file))
+    config_column = "extra_benchmark_config_str"
+    missing_config = df[config_column].isna() | df[config_column].astype(str).str.strip().eq("")
+    df.loc[missing_config, config_column] = "{}"
+    df["extra_benchmark_config"] = df[config_column].apply(json.loads)
+    return df
+
+
 # Map --sweep-mode values to the x_name used in benchmark CSV data.
 # "model_config" sweeps always write x_name="model_config"; token-length
 # sweeps use kernel-specific names (e.g. "T"), so we match them by exclusion.
@@ -280,8 +290,7 @@ def load_data(config: VisualizationsConfig) -> pd.DataFrame:
     Returns:
         pd.DataFrame: Filtered benchmark dataframe.
     """
-    df = pd.read_csv(resolve_data_path(config.data_file))
-    df["extra_benchmark_config"] = df["extra_benchmark_config_str"].apply(json.loads)
+    df = read_benchmark_data(config.data_file)
 
     mask = (
         (df["kernel_name"] == config.kernel_name)
@@ -422,8 +431,7 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
 
 def main():
     args = parse_args()
-    all_df = pd.read_csv(resolve_data_path(args.data_file))
-    all_df["extra_benchmark_config"] = all_df["extra_benchmark_config_str"].apply(json.loads)
+    all_df = read_benchmark_data(args.data_file)
 
     if args.metric_name == "memory":
         modes = ["full"]
