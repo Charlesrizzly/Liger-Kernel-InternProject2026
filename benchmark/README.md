@@ -155,6 +155,19 @@ The benchmarking system is designed to provide a **consistent, low-boilerplate w
        --metric-name memory
    ```
 
+   To generate every available metric, operation mode, and sweep as grouped bar
+   charts, provide only the kernel and benchmark CSV:
+   ```bash
+   python benchmarks_visualizer.py \
+       --kernel-name rms_norm \
+       --data-file data/all_benchmark_data_cutedsl_h100.csv \
+       --overwrite
+   ```
+
+   Change the data file to `data/all_benchmark_data_cutedsl_b200.csv` to generate
+   the same plot set for B200. Non-default CSV names are included in generated
+   image filenames, so H100 and B200 plots do not overwrite each other.
+
 4. View results
    - Generated plots will be saved in `benchmark/visualizations/`
    - Filenames include the sweep mode when specified (e.g. `geglu_speed_full_model_config.png`)

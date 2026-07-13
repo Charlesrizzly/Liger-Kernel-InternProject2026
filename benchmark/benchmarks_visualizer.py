@@ -57,9 +57,9 @@ class VisualizationsConfig:
     """
 
     kernel_name: str
-    metric_name: str
+    metric_name: str | None
     kernel_operation_mode: str = "full"
-    sweep_mode: str = "token_length"
+    sweep_mode: str | None = None
     extra_config_filter: str | None = None
     gpu_filter: str | None = None
     data_file: str | None = None
@@ -78,8 +78,9 @@ def parse_args() -> VisualizationsConfig:
     parser.add_argument(
         "--metric-name",
         type=str,
-        required=True,
-        help="Metric name to visualize (speed/memory)",
+        choices=["speed", "memory"],
+        default=None,
+        help="Metric to visualize. If omitted, generate all available metrics.",
     )
     parser.add_argument(
         "--kernel-operation-mode",
@@ -92,10 +93,11 @@ def parse_args() -> VisualizationsConfig:
         "--sweep-mode",
         type=str,
         choices=["token_length", "model_config"],
-        default="token_length",
+        default=None,
         help="Sweep mode used when running the benchmark. "
-        "'token_length' selects token/sequence-length sweep data (default); "
-        "'model_config' selects model-configuration sweep data.",
+        "'token_length' selects token/sequence-length sweep data; "
+        "'model_config' selects model-configuration sweep data. "
+        "If omitted, generate all available sweep modes.",
     )
     parser.add_argument(
         "--extra-config-filter",
@@ -399,9 +401,12 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     plt.tight_layout()
 
     sweep_suffix = f"_{config.sweep_mode}" if config.sweep_mode else ""
+    source_path = resolve_data_path(config.data_file)
+    source_stem = os.path.splitext(os.path.basename(source_path))[0]
+    source_suffix = "" if source_path == resolve_data_path(None) else f"_{source_stem}"
     out_path = os.path.join(
         VISUALIZATIONS_PATH,
-        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}.png",
+        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}{source_suffix}.png",
     )
 
     if config.display:
@@ -417,32 +422,43 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
 def main():
     args = parse_args()
     all_df = read_benchmark_data(args.data_file)
+    kernel_df = all_df[all_df["kernel_name"] == args.kernel_name]
+    metrics = [args.metric_name] if args.metric_name else kernel_df["metric_name"].dropna().unique().tolist()
+    sweeps = [args.sweep_mode] if args.sweep_mode else ["token_length", "model_config"]
 
-    if args.metric_name == "memory":
-        modes = ["full"]
-    elif args.kernel_operation_mode:
-        modes = args.kernel_operation_mode
-    else:
-        filtered = all_df[(all_df["kernel_name"] == args.kernel_name) & (all_df["metric_name"] == args.metric_name)]
-        modes = filtered["kernel_operation_mode"].unique().tolist()
-        if not modes:
-            print(f"No data found for kernel '{args.kernel_name}' and metric '{args.metric_name}'.", file=sys.stderr)
-            sys.exit(1)
+    if kernel_df.empty or not metrics:
+        print(f"No data found for kernel '{args.kernel_name}'.", file=sys.stderr)
+        sys.exit(1)
 
-    for mode in modes:
-        config = VisualizationsConfig(
-            kernel_name=args.kernel_name,
-            metric_name=args.metric_name,
-            kernel_operation_mode=mode,
-            sweep_mode=args.sweep_mode,
-            extra_config_filter=args.extra_config_filter,
-            gpu_filter=args.gpu_filter,
-            data_file=args.data_file,
-            display=args.display,
-            overwrite=args.overwrite,
+    for metric in metrics:
+        metric_df = kernel_df[kernel_df["metric_name"] == metric]
+        modes = (
+            ["full"]
+            if metric == "memory"
+            else args.kernel_operation_mode or metric_df["kernel_operation_mode"].dropna().unique().tolist()
         )
-        df = load_data(config)
-        plot_data(df, config)
+        for sweep in sweeps:
+            has_sweep_data = (
+                metric_df["x_name"].eq(SWEEP_MODE_X_NAME).any()
+                if sweep == "model_config"
+                else metric_df["x_name"].ne(SWEEP_MODE_X_NAME).any()
+            )
+            if not has_sweep_data:
+                continue
+            for mode in modes:
+                config = VisualizationsConfig(
+                    kernel_name=args.kernel_name,
+                    metric_name=metric,
+                    kernel_operation_mode=mode,
+                    sweep_mode=sweep,
+                    extra_config_filter=args.extra_config_filter,
+                    gpu_filter=args.gpu_filter,
+                    data_file=args.data_file,
+                    display=args.display,
+                    overwrite=args.overwrite,
+                )
+                df = load_data(config)
+                plot_data(df, config)
 
 
 if __name__ == "__main__":
