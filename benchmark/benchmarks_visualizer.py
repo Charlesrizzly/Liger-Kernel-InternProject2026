@@ -350,52 +350,37 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     df["kernel_provider"] = pd.Categorical(df["kernel_provider"], categories=order, ordered=True)
     df = df.sort_values(by="kernel_provider")
 
-    plt.figure(figsize=(10, 6))
+    _, ax = plt.subplots(figsize=(10, 6))
     sns.set(style="whitegrid")
-    try:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=("ci", None),
-        )
-    except Exception:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=None,
-        )
+    x_values = sorted(df["x_value"].unique()) if is_numeric_x else df["x_value"].drop_duplicates().tolist()
+    x_positions = list(range(len(x_values)))
+    bar_width = 0.8 / len(order)
+    colors = sns.color_palette("tab10", n_colors=len(order))
 
-    # For numeric x axes, show tick labels only at actual data points
-    if is_numeric_x:
-        tick_values = sorted(df["x_value"].unique())
-        ax.set_xticks(tick_values)
-        ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in tick_values])
-
-    # Seaborn can't plot pre-computed error bars, so we need to do it manually
-    lines = ax.get_lines()
-    colors = [line.get_color() for line in lines]
-
-    for (_, group_data), color in zip(df.groupby("kernel_provider"), colors):
-        y_error_lower = group_data["y_value_50"] - group_data["y_value_20"]
-        y_error_upper = group_data["y_value_80"] - group_data["y_value_50"]
-        y_error = [y_error_lower, y_error_upper]
-
-        plt.errorbar(
-            group_data["x_value"],
-            group_data["y_value_50"],
+    for provider_index, (provider, color) in enumerate(zip(order, colors)):
+        group_data = df[df["kernel_provider"] == provider].set_index("x_value").reindex(x_values)
+        y_values = group_data["y_value_50"]
+        y_error = [
+            y_values - group_data["y_value_20"],
+            group_data["y_value_80"] - y_values,
+        ]
+        offset = (provider_index - (len(order) - 1) / 2) * bar_width
+        ax.bar(
+            [position + offset for position in x_positions],
+            y_values,
+            width=bar_width,
             yerr=y_error,
-            fmt="o",
+            label=provider,
             color=color,
-            capsize=5,
+            capsize=4,
         )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(
+        [str(int(value)) if is_numeric_x and value == int(value) else str(value) for value in x_values],
+        rotation=30 if not is_numeric_x else 0,
+        ha="right" if not is_numeric_x else "center",
+    )
     # Title includes kernel name, metric, operation mode, and GPU so the
     # PNG is self-describing without relying on the filename.
     gpu = df["gpu_name"].iloc[0] if "gpu_name" in df.columns and not df["gpu_name"].empty else ""
