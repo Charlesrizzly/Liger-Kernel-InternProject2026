@@ -107,6 +107,15 @@ The benchmarking system is designed to provide a **consistent, low-boilerplate w
    python scripts/benchmark_kto_loss.py [--sweep-mode token_length] [--bt 2048]
    ```
 
+    cuTeDSL RMSNorm compare workflow:
+    ```bash
+    cd benchmark
+    python scripts/run_cutedsl_compare.py --kernel rms_norm --sweep-mode token_length --overwrite
+    python scripts/run_cutedsl_compare.py --kernel rms_norm --sweep-mode model_config --overwrite
+    ```
+
+    These compare runs write to `benchmark/data/all_benchmark_data_cutedsl.csv`.
+
 3. Visualize results
    - Use the visualization script with optional modes:
 

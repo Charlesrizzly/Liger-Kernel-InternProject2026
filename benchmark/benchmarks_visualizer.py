@@ -109,7 +109,7 @@ def parse_args() -> VisualizationsConfig:
         default=None,
         help="Benchmark CSV to read, relative to benchmark/ or absolute. "
         "Defaults to data/all_benchmark_data.csv. Use "
-        "data/all_benchmark_data_cutile.csv for Triton vs CuTile comparisons.",
+        "data/all_benchmark_data_cutedsl.csv for Triton vs cuTeDSL comparisons.",
     )
     parser.add_argument("--display", action="store_true", help="Display the visualization")
     parser.add_argument(
