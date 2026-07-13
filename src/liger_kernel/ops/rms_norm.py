@@ -17,6 +17,14 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    # torch 2.11+ may not auto-expose this on torch.distributed.
+    import torch.distributed.tensor as _torch_distributed_tensor
+
+    _DTensor = _torch_distributed_tensor.DTensor
+except Exception:
+    _DTensor = None
+
 from liger_kernel.ops.utils import calculate_settings
 from liger_kernel.ops.utils import compare_version
 from liger_kernel.ops.utils import ensure_contiguous
@@ -39,6 +47,10 @@ else:
 _CASTING_MODE_NONE: tl.constexpr = tl.constexpr(-1)
 _CASTING_MODE_LLAMA: tl.constexpr = tl.constexpr(0)
 _CASTING_MODE_GEMMA: tl.constexpr = tl.constexpr(1)
+
+
+def _is_dtensor(x) -> bool:
+    return _DTensor is not None and isinstance(x, _DTensor)
 
 
 @triton.jit
@@ -609,7 +621,7 @@ class LigerRMSNormFunction(torch.autograd.Function):
         X: (B, T, H) or (BxT, H)
         W: (H,)
         """
-        if isinstance(X, torch.distributed.tensor.DTensor):
+        if _is_dtensor(X):
             # Input tensor is output of a tensor parallel module and
             # needs to be gathered to a local tensor to compute
             # RMSE layer norm on each TP worker.
@@ -642,7 +654,7 @@ class LigerRMSNormFunction(torch.autograd.Function):
             X, RSTD = ctx.saved_tensors
             W = None
 
-        if isinstance(dY, torch.distributed.tensor.DTensor):
+        if _is_dtensor(dY):
             # Gradients are output of a tensor parallel module and
             # needs to be gathered to a local tensor for computing RMSE layer.
             # TODO: support CP.
