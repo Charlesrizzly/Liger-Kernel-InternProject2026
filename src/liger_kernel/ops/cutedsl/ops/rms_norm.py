@@ -54,13 +54,13 @@ def _rms_norm_fwd_kernel_ct(
     y,  # (n_rows, n_cols)
     w,  # (n_cols,) or dummy
     rstd_out,  # (n_rows,)
-    n_cols,
-    eps,
-    offset,
-    BLOCK_SIZE,
-    CHECK_BOUNDS,
-    CASTING_MODE,
-    ELEMENTWISE_AFFINE,
+    n_cols: ConstInt,
+    eps: ConstFloat,
+    offset: ConstFloat,
+    BLOCK_SIZE: ConstInt,
+    CHECK_BOUNDS: ConstBool,
+    CASTING_MODE: ConstInt,
+    ELEMENTWISE_AFFINE: ConstBool,
 ):
     row_idx = ct.bid(0)
     num_chunks = (n_cols + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -116,14 +116,14 @@ def _rms_norm_bwd_combined_kernel_ct(
     rstd,  # (n_rows,)
     dx,  # (n_rows, n_cols)
     dw_partial,  # (num_programs, n_cols) or dummy
-    n_rows,
-    n_cols,
-    rows_per_program,
-    offset,
-    BLOCK_SIZE,
-    CHECK_BOUNDS,
-    CASTING_MODE,
-    ELEMENTWISE_AFFINE,
+    n_rows: ConstInt,
+    n_cols: ConstInt,
+    rows_per_program: ConstInt,
+    offset: ConstFloat,
+    BLOCK_SIZE: ConstInt,
+    CHECK_BOUNDS: ConstBool,
+    CASTING_MODE: ConstInt,
+    ELEMENTWISE_AFFINE: ConstBool,
 ):
     block_id = ct.bid(0)
     col_idx = ct.arange(BLOCK_SIZE, dtype=ct.int32)
