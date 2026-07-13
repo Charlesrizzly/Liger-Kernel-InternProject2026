@@ -6,7 +6,14 @@ import cuda.tile as ct
 import torch
 
 from liger_kernel.ops.utils import ensure_contiguous
-from liger_kernel.ops.utils import is_dtensor
+
+try:
+    # torch 2.11+ may not auto-expose this on torch.distributed.
+    import torch.distributed.tensor as _torch_distributed_tensor
+
+    _DTensor = _torch_distributed_tensor.DTensor
+except Exception:
+    _DTensor = None
 
 ConstBool = ct.Constant[bool]
 ConstFloat = ct.Constant[float]
@@ -15,6 +22,10 @@ ConstInt = ct.Constant[int]
 _CASTING_MODE_NONE = -1
 _CASTING_MODE_LLAMA = 0
 _CASTING_MODE_GEMMA = 1
+
+
+def _is_dtensor(x) -> bool:
+    return _DTensor is not None and isinstance(x, _DTensor)
 
 
 def _next_power_of_2(n: int):
@@ -288,7 +299,7 @@ class LigerRMSNormFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def forward(ctx, X, W, eps, offset=0.0, casting_mode="llama", in_place=True, row_mode=None):
-        if is_dtensor(X):
+        if _is_dtensor(X):
             X = X.full_tensor()
 
         Y, X2d, RSTD, BLOCK_SIZE, num_warps, casting_mode = rms_norm_forward(X, W, eps, offset, casting_mode, row_mode)
@@ -314,7 +325,7 @@ class LigerRMSNormFunction(torch.autograd.Function):
             X, RSTD = ctx.saved_tensors
             W = None
 
-        if is_dtensor(dY):
+        if _is_dtensor(dY):
             dY = dY.full_tensor()
 
         dX, dW = rms_norm_backward(
