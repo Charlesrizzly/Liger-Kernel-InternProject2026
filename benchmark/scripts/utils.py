@@ -451,8 +451,8 @@ def run_benchmarks(
                 benchmark_data_list.append(benchmark_run_data)
 
     # Output routing for comparison runs.
-    # LIGER_BENCH_TARGET selects the destination CSV (e.g. "cutile" -> all_benchmark_data_cutile.csv).
-    # LIGER_BENCH_PROVIDER_TAG renames the "liger" provider in this run (e.g. "liger_cutile") so
+    # LIGER_BENCH_TARGET selects the destination CSV (e.g. "cutedsl" -> all_benchmark_data_cutedsl.csv).
+    # LIGER_BENCH_PROVIDER_TAG renames the "liger" provider in this run (e.g. "liger_cutedsl") so
     # multiple implementations can coexist in one CSV without colliding on the dedup key.
     target = os.environ.get("LIGER_BENCH_TARGET", "").strip().lower()
     provider_tag = os.environ.get("LIGER_BENCH_PROVIDER_TAG", "").strip().lower()
