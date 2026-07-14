@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 
 from argparse import ArgumentParser
@@ -119,7 +120,8 @@ def parse_args() -> VisualizationsConfig:
         type=str,
         default=None,
         help="Optional label (e.g. 'h100' or 'b200') appended to the output image "
-        "filename so results from different GPUs don't overwrite each other.",
+        "filename. When omitted, the GPU name from the data is used automatically so "
+        "results from different GPUs don't overwrite each other.",
     )
     parser.add_argument("--display", action="store_true", help="Display the visualization")
     parser.add_argument(
@@ -409,10 +411,14 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     plt.ylabel(ylabel)
     plt.tight_layout()
 
-    # Source suffix (e.g. "h100"/"b200") keeps H100 and B200 images from overwriting
-    # each other, since the rest of the filename is otherwise identical.
+    # Tag the filename with the GPU/source so results from different devices never
+    # collide. An explicit --source wins; otherwise derive a slug from the data's
+    # gpu_name automatically, so H100 and B200 images stay distinct even when the
+    # caller forgets --source (which previously made the second run silently overwrite
+    # or, without --overwrite, skip entirely).
     sweep_suffix = f"_{config.sweep_mode}" if config.sweep_mode else ""
-    source_suffix = f"_{config.source}" if config.source else ""
+    source_tag = config.source if config.source else gpu
+    source_suffix = f"_{re.sub(r'[^a-z0-9]+', '_', str(source_tag).lower()).strip('_')}" if source_tag else ""
     out_path = os.path.join(
         VISUALIZATIONS_PATH,
         f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}{source_suffix}.png",
@@ -420,11 +426,14 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
 
     if config.display:
         plt.show()
-    if config.overwrite or not os.path.exists(
-        out_path
-    ):  # Save the plot if it doesn't exist or if we want to overwrite it
+    if config.overwrite or not os.path.exists(out_path):
         os.makedirs(VISUALIZATIONS_PATH, exist_ok=True)
         plt.savefig(out_path)
+        print(f"Saved {out_path}")
+    else:
+        # Make the "already exists" case visible — otherwise a second run for a
+        # different config that maps to the same filename looks like it did nothing.
+        print(f"Skipped existing {out_path} (pass --overwrite to regenerate).")
     plt.close()
 
 
