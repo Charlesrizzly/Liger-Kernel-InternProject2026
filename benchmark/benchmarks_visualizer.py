@@ -41,6 +41,8 @@ class VisualizationsConfig:
         extra_config_filter (str, optional): A string to filter extra_benchmark_config.
                                             Can be a substring to match or a 'key=value' pair (e.g., "'H': 4096").
                                             Defaults to None, which means the first available config will be used if multiple exist.
+        source (str, optional): Label (e.g. "h100"/"b200") appended to the output image
+                                filename so results from different GPUs don't overwrite each other.
         display (bool): Display the visualization. Defaults to False
         overwrite (bool): Overwrite existing visualization, if none exist this flag has no effect as ones are always created and saved. Defaults to False
 
@@ -53,6 +55,7 @@ class VisualizationsConfig:
     extra_config_filter: str | None = None
     gpu_filter: str | None = None
     data_file: str | None = None
+    source: str | None = None
     display: bool = False
     overwrite: bool = False
 
@@ -110,6 +113,13 @@ def parse_args() -> VisualizationsConfig:
         help="Benchmark CSV to read, relative to benchmark/ or absolute. "
         "Defaults to data/all_benchmark_data.csv. Use "
         "data/all_benchmark_data_cutile.csv for Triton vs CuTile comparisons.",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Optional label (e.g. 'h100' or 'b200') appended to the output image "
+        "filename so results from different GPUs don't overwrite each other.",
     )
     parser.add_argument("--display", action="store_true", help="Display the visualization")
     parser.add_argument(
@@ -320,73 +330,68 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Convert x_value to numeric where possible so matplotlib uses a real
-    # numeric axis (proper proportional spacing).  String x_values (e.g.
-    # model names) stay as-is and will be treated as categorical (evenly spaced).
-    x_numeric = pd.to_numeric(df["x_value"], errors="coerce")
-    is_numeric_x = x_numeric.notna().all()
-    if is_numeric_x:
-        df["x_value"] = x_numeric
-
     xlabel = df["x_label"].iloc[0]
     ylabel = f"{config.metric_name} ({df['metric_unit'].iloc[0]})"
-    # Sort by "kernel_provider" so color assignment is stable across runs, with
-    # "liger" pinned to the END so seaborn draws it LAST (on top). Without this,
-    # any other provider with identical y-values would obscure Liger at the overlap
-    # — e.g., megatron-unfused has bit-identical memory to Liger in the
-    # megatron_cross_entropy benchmark and would hide it under alphabetical sort.
+
+    # Stable provider order (drives bar position + color), with the liger family pinned
+    # last for consistent coloring across runs. Grouped bars never overlap, so equal
+    # provider values both stay visible (the problem lines had — identical series hid
+    # each other); no z-order trick is needed.
     providers = df["kernel_provider"].unique().tolist()
-    non_liger = sorted(p for p in providers if p != "liger")
-    order = non_liger + (["liger"] if "liger" in providers else [])
-    df["kernel_provider"] = pd.Categorical(df["kernel_provider"], categories=order, ordered=True)
-    df = df.sort_values(by="kernel_provider")
+    non_liger = sorted(p for p in providers if not str(p).startswith("liger"))
+    liger = sorted(p for p in providers if str(p).startswith("liger"))
+    order = non_liger + liger
+
+    # x categories laid out on evenly spaced integer slots (categorical), sorted
+    # numerically when the x values are numbers (e.g. sequence lengths) and lexically
+    # otherwise (e.g. model names).
+    x_vals = df["x_value"].unique().tolist()
+    x_num = pd.to_numeric(pd.Series(x_vals), errors="coerce")
+    if x_num.notna().all():
+        x_sorted = [xv for _, xv in sorted(zip(x_num.tolist(), x_vals), key=lambda p: p[0])]
+        x_labels = [str(int(v)) if float(v).is_integer() else str(v) for v in sorted(x_num.tolist())]
+    else:
+        x_sorted = sorted(x_vals, key=str)
+        x_labels = [str(v) for v in x_sorted]
+
+    x_pos = list(range(len(x_sorted)))
+    n_providers = max(len(order), 1)
+    group_width = 0.8
+    bar_width = group_width / n_providers
 
     plt.figure(figsize=(10, 6))
     sns.set(style="whitegrid")
-    try:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=("ci", None),
+    cmap = plt.get_cmap("tab10")
+
+    for i, provider in enumerate(order):
+        y50, err_low, err_high = [], [], []
+        for xv in x_sorted:
+            sub = df[(df["kernel_provider"] == provider) & (df["x_value"] == xv)]
+            if len(sub):
+                row = sub.iloc[0]
+                v50, v20, v80 = float(row["y_value_50"]), float(row["y_value_20"]), float(row["y_value_80"])
+            else:
+                v50 = v20 = v80 = float("nan")
+            y50.append(v50)
+            # Asymmetric percentile whiskers: 20th below the median, 80th above.
+            err_low.append(max(v50 - v20, 0.0))
+            err_high.append(max(v80 - v50, 0.0))
+        # Center the provider's bars within each x group.
+        offset = (i - (n_providers - 1) / 2) * bar_width
+        positions = [p + offset for p in x_pos]
+        plt.bar(
+            positions,
+            y50,
+            width=bar_width,
+            label=provider,
+            color=cmap(i % 10),
+            yerr=[err_low, err_high],
+            capsize=4,
+            error_kw={"elinewidth": 1, "capthick": 1},
         )
-    except Exception:
-        ax = sns.lineplot(
-            data=df,
-            x="x_value",
-            y="y_value_50",
-            hue="kernel_provider",
-            marker="o",
-            palette="tab10",
-            errorbar=None,
-        )
 
-    # For numeric x axes, show tick labels only at actual data points
-    if is_numeric_x:
-        tick_values = sorted(df["x_value"].unique())
-        ax.set_xticks(tick_values)
-        ax.set_xticklabels([str(int(v)) if v == int(v) else str(v) for v in tick_values])
+    plt.xticks(x_pos, x_labels)
 
-    # Seaborn can't plot pre-computed error bars, so we need to do it manually
-    lines = ax.get_lines()
-    colors = [line.get_color() for line in lines]
-
-    for (_, group_data), color in zip(df.groupby("kernel_provider"), colors):
-        y_error_lower = group_data["y_value_50"] - group_data["y_value_20"]
-        y_error_upper = group_data["y_value_80"] - group_data["y_value_50"]
-        y_error = [y_error_lower, y_error_upper]
-
-        plt.errorbar(
-            group_data["x_value"],
-            group_data["y_value_50"],
-            yerr=y_error,
-            fmt="o",
-            color=color,
-            capsize=5,
-        )
     # Title includes kernel name, metric, operation mode, and GPU so the
     # PNG is self-describing without relying on the filename.
     gpu = df["gpu_name"].iloc[0] if "gpu_name" in df.columns and not df["gpu_name"].empty else ""
@@ -404,10 +409,13 @@ def plot_data(df: pd.DataFrame, config: VisualizationsConfig):
     plt.ylabel(ylabel)
     plt.tight_layout()
 
+    # Source suffix (e.g. "h100"/"b200") keeps H100 and B200 images from overwriting
+    # each other, since the rest of the filename is otherwise identical.
     sweep_suffix = f"_{config.sweep_mode}" if config.sweep_mode else ""
+    source_suffix = f"_{config.source}" if config.source else ""
     out_path = os.path.join(
         VISUALIZATIONS_PATH,
-        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}.png",
+        f"{config.kernel_name}_{config.metric_name}_{config.kernel_operation_mode}{sweep_suffix}{source_suffix}.png",
     )
 
     if config.display:
@@ -445,6 +453,7 @@ def main():
             extra_config_filter=args.extra_config_filter,
             gpu_filter=args.gpu_filter,
             data_file=args.data_file,
+            source=args.source,
             display=args.display,
             overwrite=args.overwrite,
         )
