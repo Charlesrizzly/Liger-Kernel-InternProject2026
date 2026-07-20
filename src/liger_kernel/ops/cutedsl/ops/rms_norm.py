@@ -18,12 +18,18 @@ toggle, in-place backward, and DTensor gathering.
     dw   = sum_rows dy * (x * rstd)
 
 The kernels are written for correctness and clarity first (fp32 accumulation, one
-CTA per row for the reductions). The weight gradient is reduced in parallel across
-row strips (one strip per SM, partials summed on the host — the same strategy as the
-Triton backward) rather than a single thread walking every row. They keep the hidden
-dimension fully dynamic, so a single compiled kernel serves every shape — regular or
-irregular. Further performance tuning (fused dx/dw pass, vectorized/pipelined loads)
-is left to the ``liger-kernel-perf`` workflow on real Hopper/Blackwell hardware.
+CTA per row for the forward reduction). The backward pass is fused: a single
+row-strip kernel (one strip per SM) computes the input gradient and accumulates the
+weight gradient in one sweep over its rows, so X/dY are read twice rather than three
+times (a separate dx kernel's two passes plus a standalone dw kernel). The per-column
+weight-grad partials live in registers (keyed on the compile-time column-tile count),
+so there is no dynamic-shared-memory dependence, and the partials are summed on the
+host — the same sm_count-partials strategy as the Triton backward. Very large hidden
+dims (> 16384) fall back to the original two-kernel path to avoid register spills.
+The hidden dimension stays fully dynamic, so a compiled kernel serves every row count
+at a given width — regular or irregular. Further tuning (vectorized/pipelined loads,
+caching the row in shared memory to reach a single HBM read) is left to the
+``liger-kernel-perf`` workflow on real Hopper/Blackwell hardware.
 """
 
 import cuda.bindings.driver as cuda
@@ -55,6 +61,12 @@ _str_to_casting_mode = {
 # parallelism, so we don't need a huge block.
 _NUM_WARPS = 8
 _THREADS = 32 * _NUM_WARPS
+
+# Fused backward holds one fp32 register per column tile a thread owns (NUM_COL_TILES =
+# ceil(n_cols / _THREADS)). Past this many tiles the register file pressure would spill and
+# hurt more than the saved HBM read, so very large hidden dims fall back to the two-kernel
+# path. 64 tiles == hidden dim 16384, which covers every shape in the benchmark suite.
+_MAX_FUSED_COL_TILES = 64
 
 # Compiled-kernel cache keyed on everything the kernels bake (dtypes + constexpr
 # flags). Without it every call would re-run ``cute.compile`` (tens of ms).
@@ -282,6 +294,95 @@ def _rms_norm_bwd_dw_kernel(
         mdW[strip, None][c] = acc.to(mdW.element_type)
 
 
+@cute.kernel
+def _rms_norm_bwd_fused_kernel(
+    mdY: cute.Tensor,  # (n_rows, n_cols) upstream grad
+    mX: cute.Tensor,  # (n_rows, n_cols) saved input
+    mW: cute.Tensor,  # (n_cols,) weight (affine only — this kernel is the affine path)
+    mRSTD: cute.Tensor,  # (n_rows,) fp32 reciprocal-RMS cache
+    mdX: cute.Tensor,  # (n_rows, n_cols) input grad out (may alias mdY for in-place)
+    mdW: cute.Tensor,  # (num_strips, n_cols) fp32 partial weight grads (one row per strip)
+    rows_per_strip: Int32,
+    offset: Float32,
+    CASTING_MODE: cutlass.Constexpr,
+    NUM_COL_TILES: cutlass.Constexpr,  # ceil(n_cols / _THREADS); sizes the dW register accumulator
+):
+    # Fused dX + dW backward (Triton-style). Grid = one CTA per row strip; each CTA walks
+    # its strip of rows and, per row, does the full-row dot reduction (for dX) AND folds the
+    # row's weight-grad contribution into a per-column accumulator that persists across the
+    # strip. X and dY are therefore read twice (dot pass + write pass) instead of three times
+    # (the separate dx kernel's two passes + the standalone dw kernel), and only one launch is
+    # needed. The dW accumulator lives in registers (one fp32 per owned column tile), keyed on
+    # the constexpr NUM_COL_TILES, so there is no dynamic-shared-memory dependence.
+    tid, _, _ = cute.arch.thread_idx()
+    lane = tid % 32
+    warp = tid // 32
+    strip, _, _ = cute.arch.block_idx()
+
+    n_rows = mX.shape[0]
+    n_cols = mX.shape[1]
+
+    smem = cutlass.utils.SmemAllocator()
+    sm_red = smem.allocate_tensor(Float32, cute.make_layout(_NUM_WARPS), byte_alignment=4)
+
+    # Per-column dW partials for this strip, one register per column tile this thread owns.
+    dw_acc = cute.make_rmem_tensor((NUM_COL_TILES,), Float32)
+    for ct in cutlass.range_constexpr(NUM_COL_TILES):
+        dw_acc[ct] = Float32(0.0)
+
+    row_start = strip * rows_per_strip
+    for i in cutlass.range(0, rows_per_strip):
+        r = row_start + i
+        r_valid = r < n_rows
+        rstd = Float32(0.0)
+        if r_valid:
+            rstd = mRSTD[r].to(Float32)
+
+        # --- pass 1: dot(m, x) with m = dy * (w + offset).
+        dot = Float32(0.0)
+        for ct in cutlass.range_constexpr(NUM_COL_TILES):
+            c = ct * _THREADS + tid
+            if r_valid and c < n_cols:
+                xf = mX[r, None][c].to(Float32)
+                dyf = mdY[r, None][c].to(Float32)
+                mk = dyf * (mW[c].to(Float32) + offset)
+                dot = dot + mk * xf
+        dot = _warp_reduce_sum(dot)
+        if lane == 0:
+            sm_red[warp] = dot
+        cute.arch.barrier()
+        dot_total = Float32(0.0)
+        for w in cutlass.range_constexpr(_NUM_WARPS):
+            dot_total = dot_total + sm_red[w]
+        # Fence sm_red before the next row's lane-0 writes overwrite it.
+        cute.arch.barrier()
+
+        coef = (Float32(0.0) - rstd * rstd * dot_total) / Float32(n_cols)
+
+        # --- pass 2: write dx AND accumulate dw. dy/x are re-read here (rather than cached
+        # in a dynamic-length tile) to stay shape-generic. In-place is safe: each thread reads
+        # column c before writing the same column, and pass 1 is fenced by the barrier above.
+        for ct in cutlass.range_constexpr(NUM_COL_TILES):
+            c = ct * _THREADS + tid
+            if r_valid and c < n_cols:
+                xf = mX[r, None][c].to(Float32)
+                dyf = mdY[r, None][c].to(Float32)
+                mk = dyf * (mW[c].to(Float32) + offset)
+                dxk = rstd * (mk + coef * xf)
+                mdX[r, None][c] = dxk.to(mdX.element_type)
+                # dW = sum_rows dy * xhat (no w+offset factor — this is d/dw of xhat*(offset+w)).
+                xhat = xf * rstd
+                if const_expr(CASTING_MODE == _CASTING_MODE_LLAMA):
+                    xhat = xhat.to(mX.element_type).to(Float32)
+                dw_acc[ct] = dw_acc[ct] + dyf * xhat
+
+    # Emit this strip's dW partials; the host sums the num_strips partial rows.
+    for ct in cutlass.range_constexpr(NUM_COL_TILES):
+        c = ct * _THREADS + tid
+        if c < n_cols:
+            mdW[strip, None][c] = dw_acc[ct]
+
+
 # =============================================================================
 # Host launch (compiled once per dtype/flag combo, then cached)
 # =============================================================================
@@ -346,6 +447,32 @@ def _rms_norm_bwd_dw_host(
         grid=[num_col_blocks, num_strips, 1],
         block=[_THREADS, 1, 1],
         smem=0,
+        stream=stream,
+    )
+
+
+@cute.jit
+def _rms_norm_bwd_fused_host(
+    mdY: cute.Tensor,
+    mX: cute.Tensor,
+    mW: cute.Tensor,
+    mRSTD: cute.Tensor,
+    mdX: cute.Tensor,
+    mdW: cute.Tensor,
+    rows_per_strip: Int32,
+    offset: Float32,
+    CASTING_MODE: cutlass.Constexpr,
+    NUM_COL_TILES: cutlass.Constexpr,
+    stream: cuda.CUstream = None,
+):
+    num_strips = mdW.shape[0]
+    smem_bytes = ((_NUM_WARPS * 4 + 15) // 16) * 16
+    _rms_norm_bwd_fused_kernel(
+        mdY, mX, mW, mRSTD, mdX, mdW, rows_per_strip, offset, CASTING_MODE, NUM_COL_TILES
+    ).launch(
+        grid=[num_strips, 1, 1],
+        block=[_THREADS, 1, 1],
+        smem=smem_bytes,
         stream=stream,
     )
 
@@ -425,6 +552,37 @@ def _launch_bwd_dw(dY, X, RSTD, dW_partial, rows_per_strip, casting_mode):
     _compile_cache[key](dy_ct, x_ct, rstd_ct, dw_ct, int(rows_per_strip), stream)
 
 
+def _launch_bwd_fused(dY, X, W, RSTD, dX, dW_partial, rows_per_strip, num_col_tiles, offset, casting_mode):
+    stream = _cute_stream()
+    dy_ct = to_cute_tensor(dY, assumed_align=dY.element_size())
+    x_ct = to_cute_tensor(X, assumed_align=X.element_size())
+    w_ct = to_cute_tensor(W, assumed_align=W.element_size())
+    rstd_ct = to_cute_tensor(RSTD, assumed_align=4)
+    dx_ct = to_cute_tensor(dX, assumed_align=dX.element_size())
+    dw_ct = to_cute_tensor(dW_partial, assumed_align=4)  # fp32 (num_strips, n_cols)
+
+    # Key on every baked dtype (dY, X, W — mdW/mRSTD are fp32) plus num_col_tiles, which sizes
+    # the register dW accumulator (a compile-time extent). rows_per_strip stays a runtime arg,
+    # so one compiled kernel serves every row count at a given hidden dim.
+    key = ("bwd_fused", X.dtype, dY.dtype, W.dtype, casting_mode, num_col_tiles)
+    if key not in _compile_cache:
+        _compile_cache[key] = cute.compile(
+            _rms_norm_bwd_fused_host,
+            dy_ct,
+            x_ct,
+            w_ct,
+            rstd_ct,
+            dx_ct,
+            dw_ct,
+            int(rows_per_strip),
+            float(offset),
+            casting_mode,
+            num_col_tiles,
+            stream,
+        )
+    _compile_cache[key](dy_ct, x_ct, w_ct, rstd_ct, dx_ct, dw_ct, int(rows_per_strip), float(offset), stream)
+
+
 # =============================================================================
 # Public host API (matches liger_kernel.ops.rms_norm)
 # =============================================================================
@@ -483,28 +641,38 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
     else:
         dX = torch.empty_like(dY)
 
-    # dW must be computed BEFORE dX: when in_place=True, dX aliases dY and the dX kernel
-    # overwrites dY in place, but dW = sum_rows(dY * x * rstd) needs the original dY.
-    # Neither gradient depends on the other, so ordering dW first is correct in both the
-    # in-place and out-of-place cases.
-    if elementwise_affine:
-        # Parallelize the dW reduction across row strips: one strip per SM (capped at
-        # n_rows), each producing a partial dW row, then sum the partials on the host —
-        # mirrors the Triton backward's sm_count partials + `_dW.sum(dim=0)`.
-        if X.device.type == "cuda":
-            sm_count = torch.cuda.get_device_properties(X.device).multi_processor_count
-        else:
-            sm_count = 1
-        num_strips = max(1, min(sm_count, n_rows))
-        rows_per_strip = (n_rows + num_strips - 1) // num_strips
-        dW_partial = torch.empty((num_strips, n_cols), dtype=torch.float32, device=W.device)
-        _launch_bwd_dw(dY, X, RSTD, dW_partial, rows_per_strip, casting_mode)
-        dW = dW_partial.sum(dim=0).to(W.dtype)
+    if not elementwise_affine:
+        # No weight gradient — a single dx kernel (one CTA per row) is all we need.
+        _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine)
+        return dX.view(*shape), None
+
+    # Affine: compute dX and dW. Parallelize the dW reduction across row strips — one strip
+    # per SM (capped at n_rows), each emitting a partial dW row that the host sums, mirroring
+    # the Triton backward's sm_count partials + `_dW.sum(dim=0)`.
+    if X.device.type == "cuda":
+        sm_count = torch.cuda.get_device_properties(X.device).multi_processor_count
     else:
-        dW = None
+        sm_count = 1
+    num_strips = max(1, min(sm_count, n_rows))
+    rows_per_strip = (n_rows + num_strips - 1) // num_strips
+    dW_partial = torch.empty((num_strips, n_cols), dtype=torch.float32, device=W.device)
 
-    _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine)
+    num_col_tiles = (n_cols + _THREADS - 1) // _THREADS
+    if num_col_tiles <= _MAX_FUSED_COL_TILES:
+        # Fused path: one strip kernel computes dX AND accumulates dW in a single sweep over
+        # the rows, so X/dY are read twice instead of three times (dx's two passes + a separate
+        # dw kernel) with one launch instead of two. In-place is safe — the fused kernel reads
+        # each column's dY before overwriting it with dX.
+        _launch_bwd_fused(
+            dY, X, W, RSTD, dX, dW_partial, rows_per_strip, num_col_tiles, offset, casting_mode
+        )
+    else:
+        # Very large hidden dim: fall back to the two-kernel path. dW runs BEFORE dx because
+        # in-place dx overwrites dY, but dW = sum_rows(dY * xhat) needs the original dY.
+        _launch_bwd_dw(dY, X, RSTD, dW_partial, rows_per_strip, casting_mode)
+        _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine)
 
+    dW = dW_partial.sum(dim=0).to(W.dtype)
     return dX.view(*shape), dW
 
 
