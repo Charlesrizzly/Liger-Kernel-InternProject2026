@@ -18,14 +18,14 @@ toggle, in-place backward, and DTensor gathering.
     dw   = sum_rows dy * (x * rstd)
 
 The scalar forward and split backward kernels remain correctness fallbacks for
-irregular, unaligned, and unsupported shapes.  Aligned widths through 8192 use a
-four-warp vector path: forward keeps X in registers across its reduction and output
-phase; affine backward stages one X/dY row in shared memory with cp.async, caches W
-per CTA, and emits one dW partial row per persistent strip.  The fast path is selected
-host-side only when its 16-byte alignment assumptions are true.  Its compilation key
-therefore includes the exact width and vector width; the scalar path remains
-shape-generic.  These are implementation details, not a claim about performance on a
-particular GPU.
+irregular, unaligned, and unsupported shapes. Aligned widths through 8192 use
+vector paths: forward keeps X in registers across its reduction and output phase;
+affine backward mirrors Triton's execution shape with one CTA per SM, contiguous
+persistent row ranges, width-dependent warp counts, and register-resident X/dY
+fragments reused for both dX and dW. The fast path is selected host-side only when
+its alignment assumptions are true. Its compilation key therefore includes the
+exact width, vector width, and launch geometry; the scalar path remains
+shape-generic.
 """
 
 import cuda.bindings.driver as cuda
@@ -37,11 +37,9 @@ import torch
 from cutlass import Float32
 from cutlass import Int32
 from cutlass import const_expr
-from cutlass.cute.nvgpu import cpasync
 
 from liger_kernel.ops.cutedsl.ops.rms_norm_fastpath import fast_path_vector_width
-from liger_kernel.ops.cutedsl.ops.rms_norm_fastpath import persistent_strip_count
-from liger_kernel.ops.cutedsl.ops.rms_norm_fastpath import supports_global_cp_async
+from liger_kernel.ops.cutedsl.ops.rms_norm_fastpath import triton_backward_warp_count
 from liger_kernel.ops.cutedsl.ops.utils import to_cute_tensor
 
 # Casting-mode ids — identical values to the Triton kernel so an ``int`` casting
@@ -62,8 +60,8 @@ _str_to_casting_mode = {
 _NUM_WARPS = 8
 _THREADS = 32 * _NUM_WARPS
 
-# Aligned B200/Hopper fast path.  The scalar constants above intentionally stay
-# untouched: they are also the fallback configuration for arbitrary row widths.
+# The vector forward stays at four warps. Backward chooses its warp count from the
+# hidden width to mirror the existing Triton kernel's calculate_settings heuristic.
 _FAST_NUM_WARPS = 4
 _FAST_THREADS = 32 * _FAST_NUM_WARPS
 _FAST_MAX_COLS = 8192
@@ -123,11 +121,12 @@ def _cta_reduce_sum_warp0(
     sm_result: cute.Tensor,
     lane: Int32,
     warp: Int32,
+    NUM_WARPS: cutlass.Constexpr,
 ) -> Float32:
-    """Reduce four warp partials with warp 0 and broadcast one shared scalar.
+    """Reduce warp partials with warp 0 and broadcast one shared scalar.
 
-    Only warp 0 reads the four partials.  This avoids the scalar fallback's
-    four-shared-load loop in every thread while retaining a simple, reusable CTA
+    Only warp 0 reads the partials. This avoids the scalar fallback's shared-load
+    loop in every thread while retaining a simple, reusable CTA
     reduction for the vector forward and backward paths.
     """
     val = _warp_reduce_sum(val)
@@ -136,7 +135,7 @@ def _cta_reduce_sum_warp0(
     cute.arch.barrier()
     warp0_val = Float32(0.0)
     if warp == 0:
-        if lane < _FAST_NUM_WARPS:
+        if lane < NUM_WARPS:
             warp0_val = sm_warp[lane]
         warp0_val = _warp_reduce_sum(warp0_val)
         if lane == 0:
@@ -267,7 +266,7 @@ def _rms_norm_fwd_vector_kernel(
             x_ssa = x_frags[None, ct].load().to(Float32)
             partial = partial + (x_ssa * x_ssa).reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
 
-    total = _cta_reduce_sum_warp0(partial, sm_warp, sm_result, lane, warp)
+    total = _cta_reduce_sum_warp0(partial, sm_warp, sm_result, lane, warp, _FAST_NUM_WARPS)
     rstd = cute.math.rsqrt(total / Float32(N_COLS) + eps)
     if tid == 0:
         mRSTD[row] = rstd.to(mRSTD.element_type)
@@ -416,11 +415,14 @@ def _rms_norm_bwd_fused_vector_kernel(
     N_COLS: cutlass.Constexpr,
     VEC: cutlass.Constexpr,
     NUM_VEC_TILES: cutlass.Constexpr,
+    NUM_THREADS: cutlass.Constexpr,
+    NUM_WARPS: cutlass.Constexpr,
 ):
-    """Aligned affine backward, persistent over strided rows.
+    """Aligned affine backward matching Triton's persistent execution shape.
 
-    X and dY are copied once from global into shared memory before any dX stores.
-    Besides cutting global traffic, that ordering makes aliasing mdX=mdY safe.
+    Each CTA owns a contiguous row range, loads X/dY once into registers, and
+    reuses those fragments after the row reduction for both dX and dW. The
+    reduction barrier also fences every dY load before any in-place dX store.
     """
     tid, _, _ = cute.arch.thread_idx()
     lane = tid % 32
@@ -432,15 +434,10 @@ def _rms_norm_bwd_fused_vector_kernel(
     n_vec = N_COLS // VEC
 
     smem = cutlass.utils.SmemAllocator()
-    sm_x = smem.allocate_tensor(mX.element_type, cute.make_layout((N_COLS,)), byte_alignment=16)
-    sm_dy = smem.allocate_tensor(mdY.element_type, cute.make_layout((N_COLS,)), byte_alignment=16)
-    sm_warp = smem.allocate_tensor(Float32, cute.make_layout(_FAST_NUM_WARPS), byte_alignment=4)
+    sm_warp = smem.allocate_tensor(Float32, cute.make_layout(NUM_WARPS), byte_alignment=4)
     sm_result = smem.allocate_tensor(Float32, cute.make_layout(1), byte_alignment=4)
-    sXv = cute.tiled_divide(sm_x, (VEC,))
-    sdYv = cute.tiled_divide(sm_dy, (VEC,))
 
-    # W is identical for every row a persistent CTA owns, so cache the vector
-    # fragments once before the row loop.
+    # W and dW are persistent row vectors, matching Triton's per-program state.
     gW = cute.make_tensor(
         cute.make_ptr(mW.element_type, mW.iterator.toint(), cute.AddressSpace.gmem, assumed_align=16),
         cute.make_layout((N_COLS,)),
@@ -448,33 +445,21 @@ def _rms_norm_bwd_fused_vector_kernel(
     gWv = cute.tiled_divide(gW, (VEC,))
     w_frags = cute.make_rmem_tensor((VEC, NUM_VEC_TILES), mW.element_type)
     for ct in cutlass.range_constexpr(NUM_VEC_TILES):
-        vec_idx = ct * _FAST_THREADS + tid
+        vec_idx = ct * NUM_THREADS + tid
         if vec_idx < n_vec:
             cute.autovec_copy(gWv[None, vec_idx], w_frags[None, ct])
 
-    # One fp32 dW accumulator per vector element this thread owns.
     dw_acc = cute.make_rmem_tensor((VEC, NUM_VEC_TILES), Float32)
     dw_acc.fill(0.0)
-
-    cp_x = cute.make_copy_atom(
-        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-        mX.element_type,
-        num_bits_per_copy=VEC * mX.element_type.width,
-    )
-    cp_dy = cute.make_copy_atom(
-        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-        mdY.element_type,
-        num_bits_per_copy=VEC * mdY.element_type.width,
-    )
-    x_frag = cute.make_rmem_tensor((VEC,), mX.element_type)
-    dy_frag = cute.make_rmem_tensor((VEC,), mdY.element_type)
+    x_frags = cute.make_rmem_tensor((VEC, NUM_VEC_TILES), mX.element_type)
+    dy_frags = cute.make_rmem_tensor((VEC, NUM_VEC_TILES), mdY.element_type)
     dx_frag = cute.make_rmem_tensor((VEC,), mdX.element_type)
 
-    # Striding (rather than contiguous chunks) distributes long sequences across
-    # persistent CTAs while retaining one disjoint dW partial row per strip.
+    # Triton assigns one contiguous ceil-divided row range to each SM program.
     rows_per_strip = (n_rows + num_strips - 1) // num_strips
+    row_start = strip * rows_per_strip
     for i in cutlass.range(0, rows_per_strip):
-        r = strip + i * num_strips
+        r = row_start + i
         r_valid = r < n_rows
         # Constructing a row view is pointer arithmetic even when no copy follows.
         # Clamp the inactive final iteration to row 0 to keep that pointer in bounds.
@@ -485,8 +470,7 @@ def _rms_norm_bwd_fused_vector_kernel(
         if r_valid:
             rstd = mRSTD[r].to(Float32)
 
-        # Rebuild row views with the host-validated 16-byte alignment.  cp.async
-        # stages every source vector before any potential in-place output store.
+        # Rebuild row views with the host-validated alignment for vector copies.
         x_row = mX[r_safe, None]
         dy_row = mdY[r_safe, None]
         dx_row = mdX[r_safe, None]
@@ -505,38 +489,33 @@ def _rms_norm_bwd_fused_vector_kernel(
         gXv = cute.tiled_divide(gX, (VEC,))
         gdYv = cute.tiled_divide(gdY, (VEC,))
         gdXv = cute.tiled_divide(gdX, (VEC,))
+
+        # Load every X/dY element before entering the CTA reduction. The fragments
+        # remain live across the barrier and are reused below, as in Triton's SSA row.
         for ct in cutlass.range_constexpr(NUM_VEC_TILES):
-            vec_idx = ct * _FAST_THREADS + tid
+            vec_idx = ct * NUM_THREADS + tid
             if r_valid and vec_idx < n_vec:
-                cute.copy(cp_x, gXv[None, vec_idx], sXv[None, vec_idx])
-                cute.copy(cp_dy, gdYv[None, vec_idx], sdYv[None, vec_idx])
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+                cute.autovec_copy(gXv[None, vec_idx], x_frags[None, ct])
+                cute.autovec_copy(gdYv[None, vec_idx], dy_frags[None, ct])
 
         dot = Float32(0.0)
         for ct in cutlass.range_constexpr(NUM_VEC_TILES):
-            vec_idx = ct * _FAST_THREADS + tid
+            vec_idx = ct * NUM_THREADS + tid
             if r_valid and vec_idx < n_vec:
-                cute.autovec_copy(sXv[None, vec_idx], x_frag)
-                cute.autovec_copy(sdYv[None, vec_idx], dy_frag)
                 dot = dot + (
-                    x_frag.load().to(Float32)
-                    * dy_frag.load().to(Float32)
+                    x_frags[None, ct].load().to(Float32)
+                    * dy_frags[None, ct].load().to(Float32)
                     * (w_frags[None, ct].load().to(Float32) + offset)
                 ).reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
-        dot_total = _cta_reduce_sum_warp0(dot, sm_warp, sm_result, lane, warp)
+        dot_total = _cta_reduce_sum_warp0(dot, sm_warp, sm_result, lane, warp, NUM_WARPS)
         coef = (Float32(0.0) - rstd * rstd * dot_total) / Float32(N_COLS)
 
-        # Re-read only from shared memory after the reduction.  This constrains
-        # register liveness without a second global X/dY load.
+        # Reuse the original register fragments for dX and dW.
         for ct in cutlass.range_constexpr(NUM_VEC_TILES):
-            vec_idx = ct * _FAST_THREADS + tid
+            vec_idx = ct * NUM_THREADS + tid
             if r_valid and vec_idx < n_vec:
-                cute.autovec_copy(sXv[None, vec_idx], x_frag)
-                cute.autovec_copy(sdYv[None, vec_idx], dy_frag)
-                xf = x_frag.load().to(Float32)
-                dyf = dy_frag.load().to(Float32)
+                xf = x_frags[None, ct].load().to(Float32)
+                dyf = dy_frags[None, ct].load().to(Float32)
                 mk = dyf * (w_frags[None, ct].load().to(Float32) + offset)
                 dx_frag.store((rstd * (mk + coef * xf)).to(mdX.element_type))
                 cute.autovec_copy(dx_frag, gdXv[None, vec_idx])
@@ -544,7 +523,6 @@ def _rms_norm_bwd_fused_vector_kernel(
                 if const_expr(CASTING_MODE == _CASTING_MODE_LLAMA):
                     xhat = xhat.to(mX.element_type).to(Float32)
                 dw_acc[None, ct].store(dw_acc[None, ct].load() + dyf * xhat)
-        cute.arch.barrier()
 
     # Emit this strip's dW partials; the host sums the num_strips partial rows.
     dw_row = mdW[strip, None]
@@ -555,7 +533,7 @@ def _rms_norm_bwd_fused_vector_kernel(
     gdWv = cute.tiled_divide(gdW, (VEC,))
     dw_out = cute.make_rmem_tensor((VEC,), mdW.element_type)
     for ct in cutlass.range_constexpr(NUM_VEC_TILES):
-        vec_idx = ct * _FAST_THREADS + tid
+        vec_idx = ct * NUM_THREADS + tid
         if vec_idx < n_vec:
             dw_out.store(dw_acc[None, ct].load().to(mdW.element_type))
             cute.autovec_copy(dw_out, gdWv[None, vec_idx])
@@ -669,16 +647,29 @@ def _rms_norm_bwd_fused_host(
     N_COLS: cutlass.Constexpr,
     VEC: cutlass.Constexpr,
     NUM_VEC_TILES: cutlass.Constexpr,
+    NUM_THREADS: cutlass.Constexpr,
+    NUM_WARPS: cutlass.Constexpr,
     SMEM_BYTES: cutlass.Constexpr,
     stream: cuda.CUstream = None,
 ):
     num_strips = mdW.shape[0]
-    # Two aligned row tiles plus four warp partials and one broadcast scalar.
     _rms_norm_bwd_fused_vector_kernel(
-        mdY, mX, mW, mRSTD, mdX, mdW, offset, CASTING_MODE, N_COLS, VEC, NUM_VEC_TILES
+        mdY,
+        mX,
+        mW,
+        mRSTD,
+        mdX,
+        mdW,
+        offset,
+        CASTING_MODE,
+        N_COLS,
+        VEC,
+        NUM_VEC_TILES,
+        NUM_THREADS,
+        NUM_WARPS,
     ).launch(
         grid=[num_strips, 1, 1],
-        block=[_FAST_THREADS, 1, 1],
+        block=[NUM_THREADS, 1, 1],
         smem=SMEM_BYTES,
         stream=stream,
     )
@@ -691,7 +682,7 @@ def _is_16b_row_aligned(t):
     return t.ndim < 2 or (t.stride(0) * t.element_size()) % 16 == 0
 
 
-def _fast_vector_params(n_cols, *tensors):
+def _fast_vector_params(n_cols, *tensors, num_threads=_FAST_THREADS):
     """Return (VEC, vector-tiles/thread), or None for the scalar-safe fallback."""
     if n_cols <= 0 or n_cols > _FAST_MAX_COLS or not all(_is_16b_row_aligned(t) for t in tensors):
         return None
@@ -701,7 +692,7 @@ def _fast_vector_params(n_cols, *tensors):
         return None
     if n_cols % vec:
         return None
-    return vec, (n_cols // vec + _FAST_THREADS - 1) // _FAST_THREADS
+    return vec, (n_cols // vec + num_threads - 1) // num_threads
 
 
 def _launch_fwd_vector(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_affine, vec, num_vec_tiles):
@@ -822,8 +813,20 @@ def _launch_bwd_dw(dY, X, RSTD, dW_partial, rows_per_strip, casting_mode):
     _compile_cache[key](dy_ct, x_ct, rstd_ct, dw_ct, int(rows_per_strip), stream)
 
 
-def _launch_bwd_fused(dY, X, W, RSTD, dX, dW_partial, offset, casting_mode, vec, num_vec_tiles):
-    """Launch the aligned shared-staged affine backward specialization."""
+def _launch_bwd_fused(
+    dY,
+    X,
+    W,
+    RSTD,
+    dX,
+    dW_partial,
+    offset,
+    casting_mode,
+    vec,
+    num_vec_tiles,
+    num_warps,
+):
+    """Launch the aligned register-resident affine backward specialization."""
     stream = _cute_stream()
     dy_ct = to_cute_tensor(dY, assumed_align=16)
     x_ct = to_cute_tensor(X, assumed_align=16)
@@ -832,11 +835,24 @@ def _launch_bwd_fused(dY, X, W, RSTD, dX, dW_partial, offset, casting_mode, vec,
     dx_ct = to_cute_tensor(dX, assumed_align=16)
     dw_ct = to_cute_tensor(dW_partial, assumed_align=16)  # fp32 (num_strips, n_cols)
     n_cols = X.shape[1]
-    smem_bytes = (n_cols * (X.element_size() + dY.element_size()) + (_FAST_NUM_WARPS + 1) * 4 + 15) // 16 * 16
+    num_threads = 32 * num_warps
+    smem_bytes = (((num_warps + 1) * 4 + 15) // 16) * 16
 
-    # N_COLS/VEC/NUM_VEC_TILES size rmem and smem layouts, so they must all be
-    # baked and keyed.  Runtime invocation deliberately omits constexpr values.
-    key = ("bwd_fused_vec", n_cols, vec, num_vec_tiles, smem_bytes, X.dtype, dY.dtype, W.dtype, casting_mode)
+    # The width and thread geometry size the register layouts and reduction
+    # scratch, so every value is baked into the compiled specialization.
+    key = (
+        "bwd_fused_vec",
+        n_cols,
+        vec,
+        num_vec_tiles,
+        num_threads,
+        num_warps,
+        smem_bytes,
+        X.dtype,
+        dY.dtype,
+        W.dtype,
+        casting_mode,
+    )
     if key not in _compile_cache:
         _compile_cache[key] = cute.compile(
             _rms_norm_bwd_fused_host,
@@ -851,6 +867,8 @@ def _launch_bwd_fused(dY, X, W, RSTD, dX, dW_partial, offset, casting_mode, vec,
             n_cols,
             vec,
             num_vec_tiles,
+            num_threads,
+            num_warps,
             smem_bytes,
             stream,
         )
@@ -920,34 +938,36 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
         _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine)
         return dX.view(*shape), None
 
-    # Affine: the vector fused path uses architecture-aware persistent strips.  Any
-    # failed alignment/shape precondition deliberately selects the established split
-    # dW-then-dX fallback, never the old scalar fused kernel.
+    # Affine: match Triton's one-program-per-SM persistent decomposition. Any
+    # failed alignment/shape precondition selects the established split fallback.
     if X.device.type == "cuda":
-        properties = torch.cuda.get_device_properties(X.device)
-        sm_count = properties.multi_processor_count
-        capability = (properties.major, properties.minor)
+        sm_count = torch.cuda.get_device_properties(X.device).multi_processor_count
     else:
         sm_count = 1
-        capability = (0, 0)
-    fast_params = _fast_vector_params(n_cols, dY, X, W, dX)
-    if fast_params is not None and not supports_global_cp_async(fast_params[0], X.element_size(), dY.element_size()):
-        # LoadCacheMode.GLOBAL lowers to cp.async.cg, whose copy size must be
-        # exactly 16 bytes. Mixed activation/weight dtypes can shrink the common
-        # compute vector below that width, so keep those cases on the safe split path.
-        fast_params = None
-    if fast_params is not None:
-        num_strips = persistent_strip_count(sm_count, n_cols, n_rows, capability)
-    else:
-        num_strips = max(1, min(sm_count, n_rows))
+    backward_num_warps = triton_backward_warp_count(n_cols)
+    num_threads = 32 * backward_num_warps
+    fast_params = _fast_vector_params(n_cols, dY, X, W, dX, num_threads=num_threads)
+    num_strips = max(1, min(sm_count, n_rows))
     rows_per_strip = (n_rows + num_strips - 1) // num_strips
     dW_partial = torch.empty((num_strips, n_cols), dtype=torch.float32, device=W.device)
 
     if fast_params is not None and _is_16b_row_aligned(dW_partial):
-        # One global read of each X/dY element, followed by shared-memory rereads
-        # for dX and dW.  All dY is staged before dX stores, preserving in-place
-        # behavior.
-        _launch_bwd_fused(dY, X, W, RSTD, dX, dW_partial, offset, casting_mode, *fast_params)
+        # One global read of each X/dY element; the row reduction fences those
+        # register loads before any in-place dX stores.
+        vec, num_vec_tiles = fast_params
+        _launch_bwd_fused(
+            dY,
+            X,
+            W,
+            RSTD,
+            dX,
+            dW_partial,
+            offset,
+            casting_mode,
+            vec,
+            num_vec_tiles,
+            backward_num_warps,
+        )
     else:
         # dW runs BEFORE dx because in-place dx overwrites dY, but dW needs the
         # original upstream gradient.
