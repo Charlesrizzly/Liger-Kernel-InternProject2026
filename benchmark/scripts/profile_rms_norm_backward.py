@@ -20,7 +20,14 @@ def parse_args():
     parser.add_argument("--rows", type=int, default=4096)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    parser.add_argument(
+        "--weight-dtype",
+        choices=["bfloat16", "float32"],
+        default="float32",
+        help="RMSNorm weight dtype; benchmarks use float32 weights by default",
+    )
     return parser.parse_args()
 
 
@@ -28,14 +35,17 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for RMSNorm profiling")
+    if args.iterations < 1:
+        raise ValueError("--iterations must be at least 1")
 
     dtype = getattr(torch, args.dtype)
+    weight_dtype = getattr(torch, args.weight_dtype)
     device = torch.device("cuda")
     implementation = os.environ.get("LIGER_KERNEL_IMPL", "").strip() or "triton"
 
     torch.manual_seed(42)
     x = torch.randn(args.rows, args.hidden_size, device=device, dtype=dtype)
-    w = torch.randn(args.hidden_size, device=device, dtype=dtype)
+    w = torch.randn(args.hidden_size, device=device, dtype=weight_dtype)
     dy_template = torch.randn_like(x)
 
     def forward():
@@ -61,16 +71,20 @@ def main():
     torch.cuda.synchronize()
 
     forward_state = forward()
-    dy = dy_template.clone()
+    profile_dys = [dy_template.clone() for _ in range(args.iterations)]
     torch.cuda.synchronize()
 
-    label = f"rms_norm_backward_{implementation}_m{args.rows}_n{args.hidden_size}"
+    label = (
+        f"rms_norm_backward_{implementation}_m{args.rows}_n{args.hidden_size}"
+        f"_w{args.weight_dtype}_iters{args.iterations}"
+    )
     cudart = torch.cuda.cudart()
     cudart.cudaProfilerStart()
     torch.cuda.nvtx.range_push(label)
-    dx, dw = backward(dy, forward_state)
-    torch.cuda.nvtx.range_pop()
+    for dy in profile_dys:
+        dx, dw = backward(dy, forward_state)
     torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
     cudart.cudaProfilerStop()
 
     print(
