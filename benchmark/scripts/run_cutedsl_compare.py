@@ -80,8 +80,9 @@ def main():
     for label, run_env in runs:
         print(f"\n========== {args.kernel} [{source or 'default'}]: {label} ==========\n", flush=True)
         env = {**os.environ, "LIGER_BENCH_TARGET": target, **run_env}
+        # Force overwrite so comparison runs replace stale CSV rows by default.
         result = subprocess.run(
-            [sys.executable, bench_script, *passthrough],
+            [sys.executable, bench_script, "--overwrite", *passthrough],
             env=env,
             cwd=script_dir,
         )
