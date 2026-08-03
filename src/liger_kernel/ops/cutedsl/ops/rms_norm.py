@@ -33,6 +33,42 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils
 import torch
+import os
+import json
+import time
+
+from collections import OrderedDict
+
+# ---------------------------------------------------------------------------
+# Tuning / debug env vars are read ONCE at import. These are launch-time knobs
+# (set via `env VAR=...` before the process starts); nothing mutates them at
+# runtime, so re-reading os.environ on every kernel launch was pure host
+# overhead. cProfile showed ~12 os.environ lookups per fwd+bwd pass (~1us each),
+# which dominates the launch path at the small shapes where this op is
+# host-enqueue-bound rather than GPU-bound. Hoisting removes that per-call cost
+# from every launch (forward and backward, fresh and cached tensors alike).
+# ---------------------------------------------------------------------------
+_DEBUG = bool(os.environ.get("LIGER_RMS_DEBUG"))
+_COMPILE_BUCKET = int(os.environ.get("LIGER_RMS_COMPILE_BUCKET") or 0) or None
+_RELOAD_POLICY = os.environ.get("LIGER_RMS_RELOAD_POLICY", "auto")
+_FORCE_NO_FAST = bool(int(os.environ.get("LIGER_RMS_FORCE_NO_FAST") or 0))
+_FORCE_SPLIT_BWD = bool(int(os.environ.get("LIGER_RMS_FORCE_SPLIT_BWD") or 0))
+_AUTOTUNE_FILE = os.environ.get("LIGER_RMS_AUTOTUNE_FILE") or None
+_FUSED_STRIP_MULT = int(os.environ.get("LIGER_RMS_FUSED_STRIP_MULT") or 0)
+try:
+    _BACKWARD_WARPS = int(os.environ.get("LIGER_RMS_BACKWARD_WARPS") or 0) or None
+except Exception:
+    _BACKWARD_WARPS = None
+
+
+# Lightweight debug logger controlled by env var LIGER_RMS_DEBUG
+def _rms_debug(msg):
+    if _DEBUG:
+        try:
+            print(f"[RMS_DEBUG] {time.time():.6f} {msg}", flush=True)
+        except Exception:
+            pass
+
 
 from cutlass import Float32
 from cutlass import Int32
@@ -66,6 +102,14 @@ _FAST_NUM_WARPS = 4
 _FAST_THREADS = 32 * _FAST_NUM_WARPS
 _FAST_MAX_COLS = 8192
 
+# Fused backward strip-count auto-tuning. The register-resident fused kernel runs
+# one block per strip. Its register pressure (~122 regs/thread) caps the SM at
+# ~2 resident blocks, so once each strip would otherwise process this many rows
+# per SM serially (latency-bound regime), we launch two strips per SM instead of
+# one. The threshold sits inside the B200-measured 13.8-27.7 rows/SM crossover
+# window; below it, one strip per SM is as fast or faster.
+_FUSED_DOUBLE_STRIP_ROWS_PER_SM = 16
+
 # Compiled-kernel cache keyed on everything the kernels bake (dtypes + constexpr
 # flags). Without it every call would re-run ``cute.compile`` (tens of ms).
 _compile_cache = {}
@@ -73,6 +117,64 @@ _compile_cache = {}
 # Cache the CUstream wrapper keyed on torch's raw stream handle so we don't rebuild
 # the cuda.CUstream object every launch (same trick as the cutedsl CE kernel).
 _stream_cache = {}
+
+_tensor_cache: OrderedDict = OrderedDict()
+
+# Cap on the number of marshaled cute-tensor wrappers kept alive. Keying on
+# data_ptr means a freshly-allocated output (Y/RSTD/dX from torch.empty*) gets
+# cached too, and the cute wrapper holds a DLPack reference that pins the storage.
+# An UNBOUNDED cache therefore stops the caching allocator from recycling that
+# address -- every subsequent call gets a brand-new address (a cudaMalloc storm;
+# this was the ~5x "in_place=False" backward cliff). A bounded FIFO caps how many
+# buffers can be pinned at once: stable tensors (weights, and any buffer whose
+# address the allocator recycles) stay cached and marshal in ~0.4us instead of
+# ~4us, while genuinely fresh addresses are evicted after _TENSOR_CACHE_CAP inserts
+# so the allocator can reclaim them. Eviction only drops our redundant cute wrapper
+# -- the torch tensor's own reference plus CUDA stream ordering govern the real
+# storage lifetime, so an in-flight kernel is never affected.
+#
+# Cap sizing: the fused backward's working set is ~5-8 distinct handles per pass
+# (dY, X, RSTD, dX/dW_partial, W). Cap must be >= that or the backward evicts a
+# still-hot input mid-pass and loses the speed win (measured: cap=8 keeps bwd at
+# 0.82x vs Triton, cap=4 regresses to 1.06x). But every extra slot also pins one
+# more fresh output buffer, inflating peak memory (cap=16 -> ~2.1x Triton's peak,
+# cap=8 -> ~1.8x). 8 is the knee: smallest cap that still holds the backward
+# working set, so it keeps the full speed win while pinning the fewest buffers.
+#
+# Overridable via LIGER_RMS_TENSOR_CACHE_CAP for workloads that want to trade the
+# other way: raise it (e.g. 16) for max launch speed, lower it (e.g. 4) to shave
+# peak memory at the cost of the backward's cache-hit win.
+try:
+    _TENSOR_CACHE_CAP = int(os.environ.get("LIGER_RMS_TENSOR_CACHE_CAP") or 8)
+except Exception:
+    _TENSOR_CACHE_CAP = 8
+
+
+def _to_cute_cached(t, assumed_align=16):
+    key = (t.data_ptr(), t.dtype, tuple(t.shape), tuple(t.stride()), assumed_align)
+    cached = _tensor_cache.get(key)
+    if cached is not None:
+        return cached
+    result = to_cute_tensor(t, assumed_align=assumed_align)
+    _tensor_cache[key] = result
+    if len(_tensor_cache) > _TENSOR_CACHE_CAP:
+        _tensor_cache.popitem(last=False)
+    return result
+
+
+_dw_partial_pool: dict = {}
+
+
+def _get_dw_partial_buf(num_strips, n_cols, device):
+    import torch
+
+    dev_key = device.index if device.type == "cuda" else str(device)
+    key = (dev_key, num_strips, n_cols)
+    buf = _dw_partial_pool.get(key)
+    if buf is None:
+        buf = torch.empty((num_strips, n_cols), dtype=torch.float32, device=device)
+        _dw_partial_pool[key] = buf
+    return buf
 
 
 def _cute_stream():
@@ -82,6 +184,22 @@ def _cute_stream():
         s = cuda.CUstream(raw)
         _stream_cache[raw] = s
     return s
+
+
+_sm_count_cache: dict = {}
+
+
+def _get_sm_count(device):
+    """multi_processor_count for a device, cached (the query is a ~1.3us driver call
+    otherwise paid on every backward launch)."""
+    if device.type != "cuda":
+        return 1
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    n = _sm_count_cache.get(key)
+    if n is None:
+        n = torch.cuda.get_device_properties(device).multi_processor_count
+        _sm_count_cache[key] = n
+    return n
 
 
 def _maybe_gather_dtensor(t):
@@ -683,7 +801,16 @@ def _is_16b_row_aligned(t):
 
 
 def _fast_vector_params(n_cols, *tensors, num_threads=_FAST_THREADS):
-    """Return (VEC, vector-tiles/thread), or None for the scalar-safe fallback."""
+    """Return (VEC, vector-tiles/thread), or None for the scalar-safe fallback.
+
+    Honor environment override LIGER_RMS_FORCE_NO_FAST=1 to disable the fast
+    vectorized path so experiments can compare scalar/fallback performance.
+    """
+    if _FORCE_NO_FAST:
+        if _DEBUG:
+            _rms_debug("_fast_vector_params: fast path disabled by LIGER_RMS_FORCE_NO_FAST")
+        return None
+
     if n_cols <= 0 or n_cols > _FAST_MAX_COLS or not all(_is_16b_row_aligned(t) for t in tensors):
         return None
     try:
@@ -698,14 +825,25 @@ def _fast_vector_params(n_cols, *tensors, num_threads=_FAST_THREADS):
 def _launch_fwd_vector(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_affine, vec, num_vec_tiles):
     """Launch the aligned vector forward specialization."""
     stream = _cute_stream()
-    x_ct = to_cute_tensor(X, assumed_align=16)
+    # Cache the marshaled handles for the INPUTS (X, W) -- their addresses are stable
+    # across steps (weights always; activations under a reused-buffer harness), so they
+    # hit the cache and marshal in ~0.4us. Y and RSTD are freshly allocated OUTPUTS:
+    # caching them would pin the storage and stop the allocator from recycling the
+    # address, so every call would churn a new address (misses + wasted pinning). Marshal
+    # those uncached so their addresses stay reusable.
+    x_ct = _to_cute_cached(X, assumed_align=16)
     y_ct = to_cute_tensor(Y, assumed_align=16)
     rstd_ct = to_cute_tensor(RSTD, assumed_align=4)
-    w_ct = to_cute_tensor(W, assumed_align=16) if elementwise_affine else rstd_ct
+    w_ct = _to_cute_cached(W, assumed_align=16) if elementwise_affine else rstd_ct
     n_cols = X.shape[1]
+    # Optionally bucket n_cols in the compile key to reduce cold-compile churn.
+    bucket = _COMPILE_BUCKET
+    n_cols_key = n_cols
+    if bucket is not None and bucket > 0:
+        n_cols_key = ((int(n_cols) + bucket - 1) // bucket) * bucket
     key = (
         "fwd_vec",
-        n_cols,
+        n_cols_key,
         vec,
         num_vec_tiles,
         X.dtype,
@@ -713,8 +851,12 @@ def _launch_fwd_vector(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_aff
         casting_mode,
         elementwise_affine,
     )
-    if key not in _compile_cache:
-        _compile_cache[key] = cute.compile(
+    compiled = _compile_cache.get(key)
+    _dbg = _DEBUG
+    if _dbg:
+        _rms_debug(f"_launch_fwd_vector key={key} (n_cols={n_cols} n_cols_key={n_cols_key}) cache_hit={compiled is not None}")
+    if compiled is None:
+        compiled = cute.compile(
             _rms_norm_fwd_vector_host,
             x_ct,
             w_ct,
@@ -729,7 +871,12 @@ def _launch_fwd_vector(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_aff
             num_vec_tiles,
             stream,
         )
-    _compile_cache[key](x_ct, w_ct, y_ct, rstd_ct, float(eps), float(offset), stream)
+        _compile_cache[key] = compiled
+        if _dbg:
+            _rms_debug(f"Compiled fwd_vec kernel for key: {key}")
+    elif _dbg:
+        _rms_debug(f"Reusing fwd_vec kernel for key: {key}")
+    compiled(x_ct, w_ct, y_ct, rstd_ct, float(eps), float(offset), stream)
 
 
 def _launch_fwd(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_affine):
@@ -742,11 +889,11 @@ def _launch_fwd(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_affine):
     stream = _cute_stream()
     # Scalar (non-vectorized) access, so element-size alignment is all we assume — this
     # keeps the kernel correct for unaligned contiguous slices and irregular hidden dims.
-    x_ct = to_cute_tensor(X, assumed_align=X.element_size())
-    y_ct = to_cute_tensor(Y, assumed_align=Y.element_size())
-    rstd_ct = to_cute_tensor(RSTD, assumed_align=4)  # fp32
+    x_ct = _to_cute_cached(X, assumed_align=X.element_size())
+    y_ct = _to_cute_cached(Y, assumed_align=Y.element_size())
+    rstd_ct = _to_cute_cached(RSTD, assumed_align=4)  # fp32
     # Non-affine: reuse the fp32 RSTD handle as a dummy — the kernel never reads it.
-    w_ct = to_cute_tensor(W, assumed_align=W.element_size()) if elementwise_affine else rstd_ct
+    w_ct = _to_cute_cached(W, assumed_align=W.element_size()) if elementwise_affine else rstd_ct
 
     # Key on every dtype the kernel bakes: X (also Y), and W when affine (mW.element_type
     # is a compile-time specialization). Missing W.dtype would let a bf16-activations /
@@ -771,11 +918,11 @@ def _launch_fwd(X, W, Y, RSTD, eps, offset, casting_mode, elementwise_affine):
 
 def _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine):
     stream = _cute_stream()
-    dy_ct = to_cute_tensor(dY, assumed_align=dY.element_size())
-    x_ct = to_cute_tensor(X, assumed_align=X.element_size())
-    rstd_ct = to_cute_tensor(RSTD, assumed_align=4)
-    dx_ct = to_cute_tensor(dX, assumed_align=dX.element_size())
-    w_ct = to_cute_tensor(W, assumed_align=W.element_size()) if elementwise_affine else rstd_ct
+    dy_ct = _to_cute_cached(dY, assumed_align=dY.element_size())
+    x_ct = _to_cute_cached(X, assumed_align=X.element_size())
+    rstd_ct = _to_cute_cached(RSTD, assumed_align=4)
+    dx_ct = _to_cute_cached(dX, assumed_align=dX.element_size())
+    w_ct = _to_cute_cached(W, assumed_align=W.element_size()) if elementwise_affine else rstd_ct
 
     # Key on every baked dtype: dY, X (also dX == dY.dtype), and W when affine.
     key = ("bwd_dx", X.dtype, dY.dtype, W.dtype if elementwise_affine else None, casting_mode, elementwise_affine)
@@ -797,10 +944,10 @@ def _launch_bwd_dx(dY, X, W, RSTD, dX, offset, casting_mode, elementwise_affine)
 
 def _launch_bwd_dw(dY, X, RSTD, dW_partial, rows_per_strip, casting_mode):
     stream = _cute_stream()
-    dy_ct = to_cute_tensor(dY, assumed_align=dY.element_size())
-    x_ct = to_cute_tensor(X, assumed_align=X.element_size())
-    rstd_ct = to_cute_tensor(RSTD, assumed_align=4)
-    dw_ct = to_cute_tensor(dW_partial, assumed_align=4)  # fp32 (num_strips, n_cols)
+    dy_ct = _to_cute_cached(dY, assumed_align=dY.element_size())
+    x_ct = _to_cute_cached(X, assumed_align=X.element_size())
+    rstd_ct = _to_cute_cached(RSTD, assumed_align=4)
+    dw_ct = _to_cute_cached(dW_partial, assumed_align=4)  # fp32 (num_strips, n_cols)
 
     # Key on every baked dtype: dY and X (mdW is always fp32). The llama cast bakes
     # mX.element_type; the loads bake mdY.element_type. rows_per_strip is a runtime
@@ -828,32 +975,57 @@ def _launch_bwd_fused(
 ):
     """Launch the aligned register-resident affine backward specialization."""
     stream = _cute_stream()
-    dy_ct = to_cute_tensor(dY, assumed_align=16)
-    x_ct = to_cute_tensor(X, assumed_align=16)
-    w_ct = to_cute_tensor(W, assumed_align=16)
-    rstd_ct = to_cute_tensor(RSTD, assumed_align=4)
-    dx_ct = to_cute_tensor(dX, assumed_align=16)
-    dw_ct = to_cute_tensor(dW_partial, assumed_align=16)  # fp32 (num_strips, n_cols)
+    dy_ct = _to_cute_cached(dY, assumed_align=16)
+    x_ct = _to_cute_cached(X, assumed_align=16)
+    w_ct = _to_cute_cached(W, assumed_align=16)
+    rstd_ct = _to_cute_cached(RSTD, assumed_align=4)
+    dx_ct = _to_cute_cached(dX, assumed_align=16)
+    dw_ct = _to_cute_cached(dW_partial, assumed_align=16)  # fp32 (num_strips, n_cols)
     n_cols = X.shape[1]
     num_threads = 32 * num_warps
     smem_bytes = (((num_warps + 1) * 4 + 15) // 16) * 16
 
     # The width and thread geometry size the register layouts and reduction
     # scratch, so every value is baked into the compiled specialization.
+    # Optionally bucket the n_cols compile key to reduce cold-compile churn.
+    bucket = _COMPILE_BUCKET
+    n_cols_key = n_cols
+    if bucket is not None and bucket > 0:
+        # round up to the next bucket, keep original n_cols for actual bake
+        n_cols_key = ((int(n_cols) + bucket - 1) // bucket) * bucket
+    # Support an optional reload policy tag (registers|smem|gmem|auto) baked
+    # into the compile-key so later device variants can be compiled per-policy.
+    reload_policy = _RELOAD_POLICY
     key = (
         "bwd_fused_vec",
-        n_cols,
+        n_cols_key,
         vec,
         num_vec_tiles,
         num_threads,
         num_warps,
         smem_bytes,
+        reload_policy,
         X.dtype,
         dY.dtype,
         W.dtype,
         casting_mode,
     )
-    if key not in _compile_cache:
+    if _DEBUG:
+        _rms_debug(f"_launch_bwd_fused reload_policy={reload_policy}")
+    cache_hit = key in _compile_cache
+    if _DEBUG:
+        _rms_debug(f"_launch_bwd_fused key={key} (n_cols={n_cols} n_cols_key={n_cols_key}) cache_hit={cache_hit}")
+    # Warn when a non-auto policy is requested but no device variant exists yet.
+    if reload_policy not in ("auto", "registers", "smem", "gmem"):
+        if _DEBUG:
+            _rms_debug(f"Unrecognized LIGER_RMS_RELOAD_POLICY={reload_policy}; falling back to 'auto' behavior")
+    elif reload_policy in ("smem", "gmem"):
+        # No specialized SMEM/GMEM variants implemented in this change; warn so
+        # experimenters know they're tagging the compile key but still using the
+        # current register-resident kernel implementation.
+        if _DEBUG:
+            _rms_debug(f"LIGER_RMS_RELOAD_POLICY={reload_policy} requested, but device-side variant not implemented; using current kernel implementation")
+    if not cache_hit:
         _compile_cache[key] = cute.compile(
             _rms_norm_bwd_fused_host,
             dy_ct,
@@ -872,6 +1044,11 @@ def _launch_bwd_fused(
             smem_bytes,
             stream,
         )
+        if _DEBUG:
+            _rms_debug(f"Compiled kernel for key: {key}")
+    else:
+        if _DEBUG:
+            _rms_debug(f"Reusing compiled kernel for key: {key}")
     _compile_cache[key](dy_ct, x_ct, w_ct, rstd_ct, dx_ct, dw_ct, float(offset), stream)
 
 
@@ -940,16 +1117,98 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
 
     # Affine: match Triton's one-program-per-SM persistent decomposition. Any
     # failed alignment/shape precondition selects the established split fallback.
-    if X.device.type == "cuda":
-        sm_count = torch.cuda.get_device_properties(X.device).multi_processor_count
-    else:
-        sm_count = 1
+    sm_count = _get_sm_count(X.device)
+    # Allow explicit override of backward warp count for autotuning experiments
     backward_num_warps = triton_backward_warp_count(n_cols)
+    if _BACKWARD_WARPS is not None:
+        backward_num_warps = _BACKWARD_WARPS
+        if _DEBUG:
+            _rms_debug(f"Overriding backward_num_warps with LIGER_RMS_BACKWARD_WARPS={_BACKWARD_WARPS}")
     num_threads = 32 * backward_num_warps
-    fast_params = _fast_vector_params(n_cols, dY, X, W, dX, num_threads=num_threads)
+
+    # Allow forcing the split fallback for A/B testing: set LIGER_RMS_FORCE_SPLIT_BWD=1
+    force_split = _FORCE_SPLIT_BWD
+
+    # Honor a per-shape autotune file (JSON) only when explicitly requested via
+    # the LIGER_RMS_AUTOTUNE_FILE environment variable. Expected format:
+    # { "4096": { "time": ..., "config": { "warps":8, "bucket":16, "force_split":1 } }, ... }
+    # NOTE: there is intentionally NO hardcoded default path -- a stray file must
+    # never silently alter kernel selection (a prior /tmp default forced the slow
+    # split fallback on every run).
+    try:
+        autotune_path = _AUTOTUNE_FILE
+        if autotune_path and os.path.isfile(autotune_path):
+            try:
+                with open(autotune_path, "r") as f:
+                    _autotune_map = json.load(f)
+            except Exception:
+                _autotune_map = {}
+            cfg = None
+            # keys may be strings or ints
+            if str(n_cols) in _autotune_map:
+                cfg = _autotune_map.get(str(n_cols))
+            elif n_cols in _autotune_map:
+                cfg = _autotune_map.get(n_cols)
+            if cfg:
+                # nested structure: {"time":..., "config": { ... }} or flat
+                nested = cfg.get("config") if isinstance(cfg, dict) else None
+                force_val = None
+                if isinstance(nested, dict):
+                    force_val = nested.get("force_split")
+                elif isinstance(cfg, dict):
+                    force_val = cfg.get("force_split")
+                if int(force_val or 0):
+                    force_split = True
+                    if _DEBUG:
+                        _rms_debug(f"Autotune file {autotune_path} requests force_split for n_cols={n_cols}")
+    except Exception:
+        # best-effort; ignore failures reading autotune file
+        pass
+
+    fast_params = None if force_split else _fast_vector_params(n_cols, dY, X, W, dX, num_threads=num_threads)
     num_strips = max(1, min(sm_count, n_rows))
+    # The fused register-resident backward launches exactly one block per strip
+    # (grid = num_strips). At one strip per SM its high register pressure (~122
+    # regs/thread caps the SM at 2 resident blocks) leaves only a couple of
+    # resident warps, so the kernel is occupancy/latency bound rather than
+    # compute or memory bound. Once there is enough row-parallelism that each
+    # strip would otherwise process many rows serially, launch two strips per SM
+    # to fill that register-limited 2-blocks/SM ceiling and expose more waves.
+    # (Measured on B200: ~1.2-1.5x faster for n_rows>=4096, neutral below; going
+    # past 2 strips/SM cannot raise occupancy and only adds scheduling waves.)
+    # LIGER_RMS_FUSED_STRIP_MULT overrides the auto choice with an explicit
+    # strips-per-SM count. Only applies to the fused path; the split dw kernel
+    # already saturates occupancy, so leave it untouched.
+    if fast_params is not None:
+        strip_mult = _FUSED_STRIP_MULT
+        if strip_mult <= 0:
+            # Auto: double once latency-bound (threshold sits inside the measured
+            # 13.8-27.7 rows/strip crossover window), else one strip per SM.
+            strip_mult = 2 if n_rows >= _FUSED_DOUBLE_STRIP_ROWS_PER_SM * sm_count else 1
+        if strip_mult > 1:
+            num_strips = max(1, min(n_rows, sm_count * strip_mult))
     rows_per_strip = (n_rows + num_strips - 1) // num_strips
-    dW_partial = torch.empty((num_strips, n_cols), dtype=torch.float32, device=W.device)
+    dW_partial = _get_dw_partial_buf(num_strips, n_cols, W.device)
+    if _DEBUG:
+        try:
+            _rms_debug(
+                json.dumps(
+                    {
+                        "n_rows": int(n_rows),
+                        "n_cols": int(n_cols),
+                        "sm_count": int(sm_count),
+                        "backward_num_warps": int(backward_num_warps),
+                        "num_threads": int(num_threads),
+                        "force_split": bool(force_split),
+                        "fast_params": str(fast_params),
+                        "num_strips": int(num_strips),
+                        "rows_per_strip": int(rows_per_strip),
+                        "dW_partial_shape": tuple(dW_partial.shape),
+                    }
+                )
+            )
+        except Exception:
+            _rms_debug(f"rms_norm_backward debug: n_rows={n_rows} n_cols={n_cols} force_split={force_split} fast_params={fast_params}")
 
     if fast_params is not None and _is_16b_row_aligned(dW_partial):
         # One global read of each X/dY element; the row reduction fences those
